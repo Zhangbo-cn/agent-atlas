@@ -1,0 +1,1384 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="claude:viewport-fit-sides" content="cover">
+<title>Pi Agent 解剖 · Agent Atlas</title>
+<meta name="description" content="沿着一次真实请求，拆解 Pi Agent 的代码结构、agent loop、hook 触发机制与 agent infra。">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Serif:wght@500;600&display=swap">
+<link rel="stylesheet" href="assets/site.css">
+<script>
+  (function () {
+    try {
+      var saved = localStorage.getItem("atlas-theme");
+      if (saved === "dark" || saved === "light") document.documentElement.setAttribute("data-theme", saved);
+    } catch (e) {}
+  })();
+</script>
+</head>
+<body>
+<div class="reading-progress" aria-hidden="true"><div class="reading-progress__bar" data-progress></div></div>
+
+<header class="topbar">
+  <div class="topbar__inner">
+    <a class="brand" href="index.html" aria-label="Agent Atlas 首页">
+      <span class="brand__mark" aria-hidden="true">A</span>
+      <span>Agent Atlas <small>/ 解剖室</small></span>
+    </a>
+    <nav class="nav" aria-label="主导航">
+      <a href="index.html#path">学习路径</a>
+      <a class="nav__chapter" href="pi.html" aria-current="page">Pi 深潜</a>
+      <a href="#source-map">源码导读</a>
+      <button class="icon-btn" type="button" data-theme-toggle aria-label="切换主题"></button>
+    </nav>
+  </div>
+</header>
+
+<main class="wrap article-layout">
+  <aside class="toc" data-toc aria-label="本章目录">
+    <div class="toc__title">Pi Agent / 目录</div>
+    <a href="#mental-model"><span class="toc__n">01</span>三个心智模型</a>
+    <a href="#architecture"><span class="toc__n">02</span>项目全景与分层</a>
+    <a href="#request-life"><span class="toc__n">03</span>一次请求的一生</a>
+    <a href="#agent-loop"><span class="toc__n">04</span>Agent Loop 拆解</a>
+    <a href="#hooks"><span class="toc__n">05</span>Hook 触发机制</a>
+    <a href="#infra"><span class="toc__n">06</span>Agent Infra 全景</a>
+    <a href="#lessons"><span class="toc__n">07</span>设计取舍与结论</a>
+    <a href="#source-map"><span class="toc__n">08</span>源码导读与练习</a>
+  </aside>
+
+  <article class="article">
+    <div class="article-head">
+      <span class="eyebrow">Agent Atlas · Vol. 01</span>
+      <h1>Pi Agent 解剖</h1>
+      <p class="article-head__lead">
+        一个最小、可扩展的 Agent harness。沿着一次真实请求，读懂循环、钩子、工具、上下文与会话，
+        最后把结论迁移到 Claude Code、Codex 或你自己的 Agent。
+      </p>
+      <div class="article-head__meta">
+        <span>源码快照 v1.4.0</span>
+        <span>约 35 分钟</span>
+        <span>8 节 · 5 张机制图</span>
+        <span>坐标：packages/…</span>
+      </div>
+    </div>
+
+    <details class="mobile-toc">
+      <summary>本章目录</summary>
+      <nav>
+        <a href="#mental-model">01 · 三个心智模型</a>
+        <a href="#architecture">02 · 项目全景与分层</a>
+        <a href="#request-life">03 · 一次请求的一生</a>
+        <a href="#agent-loop">04 · Agent Loop 拆解</a>
+        <a href="#hooks">05 · Hook 触发机制</a>
+        <a href="#infra">06 · Agent Infra 全景</a>
+        <a href="#lessons">07 · 设计取舍与结论</a>
+        <a href="#source-map">08 · 源码导读与练习</a>
+      </nav>
+    </details>
+
+    <!-- ============================================================ -->
+    <h2 id="mental-model"><span class="h2n">01 / MENTAL MODEL</span>先建立三个心智模型<a class="anchor" href="#mental-model" aria-label="链接到本节">#</a></h2>
+
+    <p class="lead">
+      读源码最大的浪费，是一头扎进目录树。先用三句话建立坐标系，后面的每个文件都能挂到这三个坐标上。
+    </p>
+
+    <h3>1.1 模型只会“说”，Agent 才会“做”</h3>
+    <p>
+      大模型本质是一个无状态函数：给它一段消息，它返回下一段消息。它不会读文件、不会执行命令，
+      也不会记得上一轮发生了什么。Agent 做的事情，是在模型外面套一个循环：
+    </p>
+    <ul>
+      <li>把当前上下文整理成模型能吃的消息；</li>
+      <li>请求模型，拿到文本或工具调用；</li>
+      <li>执行工具，把结果写回上下文；</li>
+      <li>判断要不要再来一轮。</li>
+    </ul>
+    <p>
+      Pi 的内核把这件事做得非常直白：<code>runLoop()</code> 就是一个 <code>while</code> 循环，
+      模型调用只是循环里的一步。你在别处看到的“Agent 框架”，大多是在这个骨架上加调度、记忆和权限。
+    </p>
+
+    <h3>1.2 一切都是消息，状态在循环外</h3>
+    <p>
+      Pi 内部流转的核心类型叫 <code>AgentMessage</code>，它是四类模型消息
+      （<code>system</code> / <code>user</code> / <code>assistant</code> / <code>toolResult</code>）
+      加上产品自定义消息（如 <code>bashExecution</code>、<code>compactionSummary</code>）的联合。
+      循环本身不持有会话状态；它每次拿到一份 <code>AgentContext</code>，返回新增的消息。
+    </p>
+    <p>
+      这带来两个直接后果。第一，循环可以被单独测试、单独替换。第二，持久化、分支、压缩都可以围绕“消息列表”做文章，
+      而不必理解模型的流式细节。会话文件里存的是消息树，不是某个框架的内部对象。
+    </p>
+
+    <div class="callout">
+      <span class="callout__label">一句话定义</span>
+      <p>
+        Agent = 一个把“模型输出”变成“下一步行动”的循环，加上让循环可持续的上下文与状态管理。
+        循环决定能不能动，上下文决定动得对不对，状态决定下一次还能不能接着动。
+      </p>
+    </div>
+
+    <h3>1.3 引擎和产品是两层，不要混着读</h3>
+    <p>
+      Pi 把 Agent 拆成两个包：<code>pi-agent-core</code> 是引擎，<code>pi-coding-agent</code> 是产品。
+      引擎只认识消息、工具和事件；产品才知道文件系统、会话、CLI、扩展和主题。读代码时先问自己：
+      “这个文件是在实现循环，还是在实现围绕循环的产品行为？”答案会决定你该用哪种阅读方式。
+    </p>
+
+    <div class="cards-2">
+      <div class="mini-card">
+        <h4>pi-agent-core</h4>
+        <p>约 2,500 行。定义 loop、状态包装、工具契约、事件流。没有 CLI、没有会话文件、没有扩展加载。</p>
+      </div>
+      <div class="mini-card">
+        <h4>pi-coding-agent</h4>
+        <p>约 76,000 行。把引擎装配成可用产品：会话树、系统提示、内置工具、扩展系统、四种运行模式和 TUI。</p>
+      </div>
+    </div>
+
+    <!-- ============================================================ -->
+    <h2 id="architecture"><span class="h2n">02 / ARCHITECTURE</span>项目全景与分层<a class="anchor" href="#architecture" aria-label="链接到本节">#</a></h2>
+
+    <p class="lead">
+      Pi 是一个 npm workspaces monorepo，<code>packages/</code> 下有 11 个包。初学只需要盯住 3 个：
+      <code>pi-ai</code>、<code>pi-agent-core</code>、<code>pi-coding-agent</code>。其余的包按需展开。
+    </p>
+
+    <h3>2.1 包地图：谁依赖谁</h3>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr><th>层</th><th>包</th><th>职责</th><th>初学优先级</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>模型层</td><td><code>pi-ai</code></td><td>统一多 provider LLM API、模型目录、鉴权、流式事件、重试</td><td>必读边界</td></tr>
+          <tr><td>内核层</td><td><code>pi-agent-core</code></td><td>Agent loop、状态包装、工具契约、生命周期事件</td><td>最先读</td></tr>
+          <tr><td>产品层</td><td><code>pi-coding-agent</code></td><td>CLI、会话树、系统提示、内置工具、扩展、交互/打印/JSON/RPC/SDK</td><td>主体</td></tr>
+          <tr><td>界面层</td><td><code>pi-tui</code></td><td>终端 UI 组件与差分渲染</td><td>按需</td></tr>
+          <tr><td>扩展运行时</td><td><code>pi-codemode</code></td><td>QuickJS-WASM 沙箱，只暴露注入的工具</td><td>进阶</td></tr>
+          <tr><td>协议</td><td><code>pi-mcp</code></td><td>独立 MCP 客户端，stdio / HTTP 传输</td><td>进阶</td></tr>
+          <tr><td>持久化运行时</td><td><code>pi-durable</code></td><td>实验性：会话、任务、工具调用先落盘再展示，可恢复</td><td>暂缓</td></tr>
+          <tr><td>远程执行</td><td><code>pi-env</code></td><td>通过 SSH 把工具执行放到远端机器</td><td>暂缓</td></tr>
+          <tr><td>插件宿主</td><td><code>chord</code></td><td>可热重载对象、契约、复制状态、JSON 链接上的 RPC</td><td>暂缓</td></tr>
+          <tr><td>可观测性</td><td><code>pi-telemetry</code></td><td>厂商无关的 telemetry 契约与 schema</td><td>暂缓</td></tr>
+          <tr><td>评测</td><td><code>pi-evals</code></td><td>评测脚本与数据集</td><td>按需</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <p>
+      依赖方向很干净：<code>pi-coding-agent → pi-agent-core → pi-ai</code>。
+      <code>pi-tui</code> 不反过来依赖产品，<code>pi-durable</code> 只依赖 <code>pi-ai</code> 和 <code>chord</code>。
+      没有循环依赖，也没有“核心包偷偷 import 产品包”的情况。
+    </p>
+
+    <figure class="diagram">
+      <svg viewBox="0 0 820 470" role="img" aria-label="Pi 的分层：界面层、产品层、内核层、StreamFn 边界、模型层；左侧是 TUI，右侧是资源、设置和模型运行时。">
+        <defs>
+          <marker id="archArrow" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+            <path d="M0,0 L10,5 L0,10 z" fill="currentColor"/>
+          </marker>
+          <marker id="archArrowAccent" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+            <path d="M0,0 L10,5 L0,10 z" fill="var(--accent)"/>
+          </marker>
+        </defs>
+
+        <text x="40" y="34" class="dg-sub">请求向下</text>
+        <path d="M44,44 L44,420" class="dg-arrow dg-arrow--dashed" marker-end="url(#archArrow)"/>
+        <text x="56" y="240" class="dg-sub" transform="rotate(-90 56 240)">事件向上</text>
+        <path d="M112,420 L112,44" class="dg-arrow dg-arrow--accent" marker-end="url(#archArrowAccent)"/>
+
+        <rect x="130" y="24" width="520" height="64" rx="4" class="dg-box dg-box--soft"/>
+        <text x="148" y="50" class="dg-label">界面层</text>
+        <text x="148" y="70" class="dg-sub">Interactive TUI · Print · JSON · RPC · TypeScript SDK</text>
+
+        <rect x="130" y="108" width="520" height="88" rx="4" class="dg-box--accent dg-box"/>
+        <text x="148" y="134" class="dg-label">产品层 · pi-coding-agent</text>
+        <text x="148" y="156" class="dg-sub">AgentSession · SessionManager · ExtensionRunner</text>
+        <text x="148" y="174" class="dg-sub">system prompt · built-in tools · compaction · modes</text>
+
+        <rect x="130" y="216" width="520" height="88" rx="4" class="dg-box"/>
+        <text x="148" y="242" class="dg-label">内核层 · pi-agent-core</text>
+        <text x="148" y="264" class="dg-sub">Agent（状态 / 队列 / 监听器）</text>
+        <text x="148" y="282" class="dg-sub">runLoop（turn / tool calls / events）</text>
+
+        <rect x="130" y="324" width="520" height="42" rx="4" class="dg-box dg-box--soft"/>
+        <text x="148" y="350" class="dg-label">StreamFn</text>
+        <text x="250" y="350" class="dg-sub">唯一的模型调用边界：模型 + 上下文 + 选项 → 事件流</text>
+
+        <rect x="130" y="386" width="520" height="60" rx="4" class="dg-box"/>
+        <text x="148" y="412" class="dg-label">模型层 · pi-ai</text>
+        <text x="148" y="432" class="dg-sub">provider adapters · model catalog · auth · retries · EventStream</text>
+
+        <rect x="686" y="108" width="112" height="88" rx="4" class="dg-box dg-box--soft"/>
+        <text x="700" y="134" class="dg-label">TUI</text>
+        <text x="700" y="154" class="dg-sub">differential</text>
+        <text x="700" y="170" class="dg-sub">rendering</text>
+
+        <rect x="686" y="216" width="112" height="88" rx="4" class="dg-box dg-box--soft"/>
+        <text x="700" y="242" class="dg-label">资源</text>
+        <text x="700" y="262" class="dg-sub">ResourceLoader</text>
+        <text x="700" y="278" class="dg-sub">Settings · Model</text>
+
+        <path d="M650,150 L684,150" class="dg-arrow" marker-end="url(#archArrow)"/>
+        <path d="M650,260 L684,260" class="dg-arrow" marker-end="url(#archArrow)"/>
+      </svg>
+      <figcaption>
+        读图顺序：界面只发 prompt、收事件；产品层决定“这次请求用什么上下文和工具”；内核层只负责把 turn 跑完；
+        模型差异被 <code>StreamFn</code> 挡住。虚线向下是数据流，实线向上是事件流。
+      </figcaption>
+    </figure>
+
+    <h3>2.2 两个包的目录怎么读</h3>
+    <p>
+      <code>packages/agent/src/</code> 只有 5 个文件，建议按下面顺序通读，一遍就能建立内核的完整图像：
+    </p>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>文件</th><th>看什么</th></tr></thead>
+        <tbody>
+          <tr><td><code>types.ts</code></td><td>所有契约：<code>AgentMessage</code>、<code>AgentTool</code>、<code>AgentEvent</code>、<code>AgentLoopConfig</code></td></tr>
+          <tr><td><code>agent-loop.ts</code></td><td>核心：<code>runLoop</code>、模型流处理、工具批处理、错误与截断</td></tr>
+          <tr><td><code>agent.ts</code></td><td>有状态包装：<code>Agent</code> 类、消息队列、订阅、abort、reset</td></tr>
+          <tr><td><code>stream-fn.ts</code></td><td>默认 stream 函数，把内核接到 <code>pi-ai</code></td></tr>
+          <tr><td><code>proxy.ts</code></td><td>转发/代理相关的小工具，可最后看</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <p>
+      <code>packages/coding-agent/src/</code> 大得多，但目录边界很稳定。先记住四块：
+    </p>
+    <ul>
+      <li><strong><code>core/</code></strong>：产品的心脏。<code>agent-session.ts</code> 把所有东西接起来；
+        <code>session-manager.ts</code> 管消息树；<code>extensions/</code> 是钩子运行时；
+        <code>tools/</code> 是内置工具；<code>compaction/</code> 管上下文压缩；<code>system-prompt.ts</code> 拼提示词。</li>
+      <li><strong><code>modes/</code></strong>：四种 I/O 外壳。<code>interactive/</code> 是 TUI，<code>rpc/</code> 是 JSONL 协议，
+        <code>print-mode.ts</code> 是一次性输出。它们共享同一个 <code>AgentSession</code>。</li>
+      <li><strong><code>extensions/</code></strong>：内置扩展（codemode、MCP、tool search、llama），不是扩展运行时本身。</li>
+      <li><strong><code>cli/</code> + <code>main.ts</code></strong>：启动装配线。参数解析、鉴权、模型选择、信任决策、模式分发。</li>
+    </ul>
+
+    <div class="callout callout--warn">
+      <span class="callout__label">阅读顺序提醒</span>
+      <p>
+        不要从 <code>main.ts</code> 开始读。它很长的原因是“装配”和“兼容性处理”，不是“Agent 逻辑”。
+        先读 <code>agent-loop.ts</code> 和 <code>agent.ts</code>，再读 <code>sdk.ts</code> 里 <code>new Agent(...)</code>
+        的那 30 行，你会立刻看清各层的接法。
+      </p>
+    </div>
+
+    <!-- ============================================================ -->
+    <h2 id="request-life"><span class="h2n">03 / REQUEST LIFE</span>一次请求的一生<a class="anchor" href="#request-life" aria-label="链接到本节">#</a></h2>
+
+    <p class="lead">
+      以用户在项目目录里输入“把 README 里的 TODO 修掉”为例。下面十站不是调用栈背诵，而是三个问题的答案：
+      谁拥有状态、谁做决策、谁只负责观察。
+    </p>
+
+    <div class="steps">
+      <div class="step">
+        <h4>启动：先把“环境”装好</h4>
+        <p>
+          <code>main.ts</code> 解析参数，创建 <code>SettingsManager</code>、<code>SessionManager</code>、
+          <code>ModelRuntime</code> 和 <code>ResourceLoader</code>，再通过 <code>createAgentSession()</code>
+          组装出 <code>Agent</code> 和 <code>AgentSession</code>。最后根据模式启动 TUI、打印模式或 RPC。
+          这一步不碰模型，只准备“之后谁都能用”的服务。
+        </p>
+      </div>
+      <div class="step">
+        <h4>输入：产品层先过一遍</h4>
+        <p>
+          输入到达 <code>AgentSession.prompt()</code>。它先处理扩展命令，再发 <code>input</code> 钩子，
+          然后展开 <code>/skill:</code> 和 prompt template。若当前正在流式输出，消息不会打断循环，
+          而是进入 <code>steer</code> 或 <code>followUp</code> 队列。最后做模型与鉴权检查。
+        </p>
+      </div>
+      <div class="step">
+        <h4>起跑：<code>before_agent_start</code> 与上下文装载</h4>
+        <p>
+          <code>_prepareRun()</code> 先检查是否需要压缩，再发 <code>before_agent_start</code>，
+          允许扩展修改 prompt 的各个 section、追加消息、甚至替换整个系统提示。
+          然后构造 user message，比较“当前提示 section / 工具集”和 transcript 里的状态，
+          把差异写成一个 system message 补丁。
+        </p>
+      </div>
+      <div class="step">
+        <h4>进内核：snapshot + loop config</h4>
+        <p>
+          <code>Agent.prompt()</code> 把当前消息和工具复制成 <code>AgentContext</code>，
+          再把模型、thinking level、各类回调、队列读取函数打包成 <code>AgentLoopConfig</code>，
+          交给 <code>runAgentLoop()</code>。从这里开始，产品层不再直接驱动循环，只通过回调和事件参与。
+        </p>
+      </div>
+      <div class="step">
+        <h4>请求前：<code>prepareRequest</code> 做最后一次投影</h4>
+        <p>
+          <code>AgentSession</code> 安装的 <code>prepareRequest</code> 会用会话树重新构建模型可见的上下文，
+          处理自动压缩、虚拟模型路由；随后 <code>transformContext</code> 触发 <code>context</code> /
+          <code>context_with_system</code> 扩展事件；最后 <code>convertToLlm</code> 把 <code>AgentMessage[]</code>
+          转成 provider 能吃的 <code>Message[]</code>。
+        </p>
+      </div>
+      <div class="step">
+        <h4>模型：流式响应与“半成品消息”</h4>
+        <p>
+          <code>streamAssistantResponse()</code> 调用 <code>streamFn</code>。收到 <code>start</code> 时把 partial
+          assistant message 放进上下文；之后每个 delta 更新同一个对象；<code>done</code> 时用最终消息替换。
+          所以 UI 能看到 <code>message_start → message_update… → message_end</code>，但上下文里始终只有一条 assistant message。
+        </p>
+      </div>
+      <div class="step">
+        <h4>工具：先验参，再执行，再后处理</h4>
+        <p>
+          从 assistant message 里取出 <code>toolCall</code>。每个调用先 <code>prepareArguments</code>、
+          schema 校验，再过 <code>beforeToolCall</code>（扩展的 <code>tool_call</code> 钩子，可改参或拦截）。
+          允许执行后，按 sequential 或 parallel 跑 <code>execute()</code>；结束后过 <code>afterToolCall</code>
+          （扩展的 <code>tool_result</code>，可改内容/错误标记），生成 <code>toolResult</code> 消息。
+        </p>
+      </div>
+      <div class="step">
+        <h4>收尾：<code>turn_end</code> 与是否继续</h4>
+        <p>
+          一个 turn 的 assistant 消息和全部 tool result 都写回后，<code>finishTurn</code> 触发
+          <code>turn_end</code> 边界。扩展可以追加 entry 或要求再跑一次；否则循环看还有没有 tool call
+          或 steering 消息，有就进入下一轮，没有就准备结束。
+        </p>
+      </div>
+      <div class="step">
+        <h4>run 结束：重试、压缩、队列、settle</h4>
+        <p>
+          <code>agent_end</code> 只代表这一轮低层循环结束。<code>AgentSession</code> 还会检查可重试错误、
+          上下文是否超限、队列里有没有新消息；需要时调用 <code>agent.continue()</code> 再开一轮。
+          真正“不会自动继续”的信号是 <code>agent_settled</code>。
+        </p>
+      </div>
+      <div class="step">
+        <h4>落盘：只持久化“已定稿”的消息</h4>
+        <p>
+          每条消息的 <code>message_end</code> 会触发 <code>SessionManager.appendMessage()</code>，
+          追加到 JSONL 的会话树里。流式增量不会落盘；压缩会追加一个 compaction entry；
+          扩展的私有状态可以走 <code>appendEntry()</code>，不进入模型上下文。
+        </p>
+      </div>
+    </div>
+
+    <figure class="diagram">
+      <svg viewBox="0 0 720 390" role="img" aria-label="一次请求的主环路：界面/AgentSession 启动 run，runLoop 请求模型，模型事件回到 runLoop，runLoop 调用工具，工具结果回到 runLoop，消息写入会话。">
+        <defs>
+          <marker id="flowArrow" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="5.5" markerHeight="5.5" orient="auto-start-reverse">
+            <path d="M0,0 L10,5 L0,10 z" fill="currentColor"/>
+          </marker>
+          <marker id="flowArrowAccent" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="5.5" markerHeight="5.5" orient="auto-start-reverse">
+            <path d="M0,0 L10,5 L0,10 z" fill="var(--accent)"/>
+          </marker>
+        </defs>
+
+        <rect x="240" y="24" width="230" height="56" rx="4" class="dg-box dg-box--accent"/>
+        <text x="355" y="47" text-anchor="middle" class="dg-label">界面 / AgentSession</text>
+        <text x="355" y="66" text-anchor="middle" class="dg-sub">prompt · prepareRun · projection</text>
+
+        <rect x="240" y="150" width="230" height="60" rx="4" class="dg-box"/>
+        <text x="355" y="175" text-anchor="middle" class="dg-label">Agent / runLoop</text>
+        <text x="355" y="194" text-anchor="middle" class="dg-sub">turn · queue · tool batch</text>
+
+        <rect x="530" y="150" width="170" height="60" rx="4" class="dg-box dg-box--soft"/>
+        <text x="615" y="175" text-anchor="middle" class="dg-label">StreamFn</text>
+        <text x="615" y="194" text-anchor="middle" class="dg-sub">pi-ai → provider</text>
+
+        <rect x="240" y="270" width="230" height="56" rx="4" class="dg-box dg-box--soft"/>
+        <text x="355" y="293" text-anchor="middle" class="dg-label">Tools</text>
+        <text x="355" y="312" text-anchor="middle" class="dg-sub">read · bash · edit · write</text>
+
+        <rect x="24" y="150" width="170" height="60" rx="4" class="dg-box"/>
+        <text x="109" y="175" text-anchor="middle" class="dg-label">Session</text>
+        <text x="109" y="194" text-anchor="middle" class="dg-sub">JSONL tree</text>
+
+        <path d="M355,80 L355,146" class="dg-arrow dg-arrow--accent" marker-end="url(#flowArrowAccent)"/>
+        <text x="365" y="112" class="dg-sub">run</text>
+
+        <path d="M470,172 L526,172" class="dg-arrow dg-arrow--accent" marker-end="url(#flowArrowAccent)"/>
+        <text x="475" y="162" class="dg-sub">request</text>
+        <path d="M526,196 L474,196" class="dg-arrow dg-arrow--dashed" marker-end="url(#flowArrow)"/>
+        <text x="475" y="212" class="dg-sub">events</text>
+
+        <path d="M355,210 L355,266" class="dg-arrow dg-arrow--accent" marker-end="url(#flowArrowAccent)"/>
+        <text x="363" y="238" class="dg-sub">tool calls</text>
+        <path d="M395,266 L395,214" class="dg-arrow dg-arrow--dashed" marker-end="url(#flowArrow)"/>
+        <text x="406" y="262" class="dg-sub">results</text>
+
+        <path d="M240,180 L198,180" class="dg-arrow" marker-end="url(#flowArrow)"/>
+        <text x="203" y="170" class="dg-sub">message_end</text>
+
+        <path d="M440,150 L440,84" class="dg-arrow dg-arrow--dashed" marker-end="url(#flowArrow)"/>
+        <text x="449" y="118" class="dg-sub">agent_end</text>
+
+        <line x1="24" y1="352" x2="700" y2="352" class="dg-rule"/>
+        <text x="24" y="374" class="dg-sub">实线向下：请求与调用。虚线向上：事件与结果。扩展钩子从 AgentSession 和 runLoop 的固定切点接入。</text>
+      </svg>
+      <figcaption>
+        请求的主环路只有五个角色：界面/产品层发起 run，runLoop 请求模型并执行工具，模型事件和工具结果回到 runLoop，
+        定稿消息写入会话。理解这张图，剩下的都是边界处理。
+      </figcaption>
+    </figure>
+
+    <h3>3.1 三个“不要混”</h3>
+    <div class="cards-2">
+      <div class="mini-card">
+        <h4>UI 不驱动循环</h4>
+        <p>UI 调用 <code>prompt()</code> 后只订阅事件。循环的所有权在 <code>Agent</code>，这样 RPC、打印模式和 SDK 才能复用同一套行为。</p>
+      </div>
+      <div class="mini-card">
+        <h4>流式消息 ≠ 已持久化消息</h4>
+        <p>partial assistant message 只存在于运行中的上下文；只有 <code>message_end</code> 的最终对象会进入会话文件。</p>
+      </div>
+      <div class="mini-card">
+        <h4><code>agent_end</code> ≠ 结束</h4>
+        <p>它只是“这一轮低层循环停了”。重试、压缩、队列都可能让 <code>AgentSession</code> 再调用一次 <code>continue()</code>。</p>
+      </div>
+      <div class="mini-card">
+        <h4>系统提示不是一段字符串</h4>
+        <p>它是 transcript 里的 system message：初始带完整 sections，之后只追加差异补丁。这样恢复会话时能精确重放。</p>
+      </div>
+    </div>
+
+    <!-- ============================================================ -->
+    <h2 id="agent-loop"><span class="h2n">04 / AGENT LOOP</span>Agent Loop 拆解<a class="anchor" href="#agent-loop" aria-label="链接到本节">#</a></h2>
+
+    <p class="lead">
+      打开 <code>packages/agent/src/agent-loop.ts</code>。整个引擎只有一个核心函数 <code>runLoop</code>。
+      先记住两个循环和三个切点，再去看分支，否则很容易被错误处理淹没。
+    </p>
+
+    <h3>4.1 先看数据，不看流程</h3>
+    <p>
+      循环的输入只有四样东西：<code>AgentContext</code>（消息 + 工具）、<code>AgentLoopConfig</code>
+      （模型 + 回调）、<code>AbortSignal</code>、<code>StreamFn</code>。输出是一个
+      <code>EventStream&lt;AgentEvent, AgentMessage[]&gt;</code>：一边推事件给 UI，一边在结束时给出本次新增的消息。
+    </p>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>类型</th><th>关键字段</th><th>为什么重要</th></tr></thead>
+        <tbody>
+          <tr><td><code>AgentMessage</code></td><td><code>role</code>、<code>content</code>、<code>timestamp</code></td><td>循环内部统一语言；可被产品扩展</td></tr>
+          <tr><td><code>AgentContext</code></td><td><code>messages</code>、<code>tools</code></td><td>每次 run 的快照，不是全局单例</td></tr>
+          <tr><td><code>AgentTool</code></td><td><code>parameters</code>、<code>execute</code>、<code>executionMode</code></td><td>工具是数据 + 函数，不是框架子类</td></tr>
+          <tr><td><code>AgentEvent</code></td><td><code>agent_*</code>、<code>turn_*</code>、<code>message_*</code>、<code>tool_execution_*</code></td><td>UI 和产品层的唯一观察接口</td></tr>
+          <tr><td><code>AgentLoopConfig</code></td><td>回调集合</td><td>产品不改循环，只挂回调</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <p>
+      关键边界在 <code>streamAssistantResponse()</code>：它先调用 <code>transformContext</code>（仍是
+      <code>AgentMessage[]</code>），再调用 <code>convertToLlm</code> 转成 <code>Message[]</code>，然后才交给
+      <code>StreamFn</code>。所以“产品自定义消息”永远不会泄漏到 provider 适配层。
+    </p>
+
+    <h3>4.2 两个循环：turn 内循环与 run 外循环</h3>
+    <p>
+      内层循环负责“把当前这口气喘完”：只要还有工具调用，或者还有 steering 消息，就再来一个 turn。
+      外层循环负责“喘完之后还要不要继续”：看 follow-up 消息，或者 <code>finishTurn</code> 明确要求 continue。
+    </p>
+
+    <div class="code-cap"><span>agent-loop.ts · runLoop 的骨架</span><span>简化伪代码</span></div>
+<pre><code><span class="c">// 外层：一次 run 可能包含多个 turn</span>
+pending = drainSteering()
+
+<span class="k">while</span> (<span class="k">true</span>) {
+  hasMoreToolCalls = <span class="k">true</span>
+
+  <span class="c">// 内层：turn 循环</span>
+  <span class="k">while</span> (hasMoreToolCalls || pending.length &gt; 0) {
+    <span class="k">if</span> (lastTurn) {
+      next = prepareNextTurn(lastTurn)   <span class="c">// 可换 context / model / thinking</span>
+      emit(<span class="s">"turn_start"</span>)
+    }
+
+    append(preparedMessages + pending)
+    pending = []
+
+    update = prepareRequest(context)      <span class="c">// 每次请求前都会调用</span>
+    message = streamAssistantResponse()   <span class="c">// transform → convert → streamFn</span>
+
+    <span class="k">if</span> (message.stopReason == <span class="s">"error"</span> || <span class="s">"aborted"</span>)
+      finishTurn(); emit(<span class="s">"turn_end"</span>); emit(<span class="s">"agent_end"</span>); <span class="k">return</span>
+
+    toolCalls = message.content.filter(isToolCall)
+    hasMoreToolCalls = <span class="k">false</span>
+
+    <span class="k">if</span> (toolCalls.length &gt; 0) {
+      <span class="k">if</span> (message.stopReason == <span class="s">"length"</span>) {
+        failAllToolCalls()              <span class="c">// 参数可能被截断，不能执行</span>
+      } <span class="k">else</span> {
+        results = executeToolCalls()    <span class="c">// parallel 或 sequential</span>
+      }
+      hasMoreToolCalls = !results.terminate
+      append(results)
+    }
+
+    decision = finishTurn()
+    emit(<span class="s">"turn_end"</span>)
+    <span class="k">if</span> (decision == <span class="s">"end"</span>) { emit(<span class="s">"agent_end"</span>); <span class="k">return</span> }
+
+    pending = drainSteering()
+  }
+
+  <span class="c">// 内层停了：看 follow-up 或显式 continue</span>
+  followUps = drainFollowUps()
+  <span class="k">if</span> (followUps.length &gt; 0) { pending = followUps; <span class="k">continue</span> }
+  <span class="k">if</span> (explicitContinuation) { explicitContinuation = <span class="k">false</span>; <span class="k">continue</span> }
+  <span class="k">break</span>
+}
+
+emit(<span class="s">"agent_end"</span>)</code></pre>
+
+    <div class="source">
+      <span class="source__label">源码坐标</span>
+      <code>packages/agent/src/agent-loop.ts:111</code>
+      <code>runAgentLoop()</code>
+      <code>packages/agent/src/agent-loop.ts:172</code>
+      <code>runLoop()</code>
+      <code>packages/agent/src/agent-loop.ts:390</code>
+      <code>streamAssistantResponse()</code>
+    </div>
+
+    <h3>4.3 turn 到底是什么</h3>
+    <p>
+      Pi 里的 <strong>turn = 一次 assistant 响应 + 这次响应请求的全部工具执行 + 对应的 toolResult 消息</strong>。
+      它不是“一条用户消息”，也不是“一次模型请求”。一次用户输入通常包含多个 turn：模型先调工具，看到结果后再回答，
+      再调工具……直到某次 assistant 响应里没有 tool call，循环才自然停下。
+    </p>
+    <div class="callout">
+      <span class="callout__label">为什么这个定义重要</span>
+      <p>
+        所有调度都以 turn 为边界：steering 只能在 turn 结束后插入，不能插在 tool call 和它的 result 之间；
+        压缩、重试、扩展的 <code>turn_end</code> 也都以“这一轮的工具结果已经齐了”为前提。
+        一旦理解这一点，很多看似随意的检查就都说得通了。
+      </p>
+    </div>
+
+    <h3>4.4 工具批处理：并行是默认，顺序是例外</h3>
+    <p>
+      一条 assistant 消息里可能有多个 tool call。默认策略是 <code>parallel</code>：
+      先按顺序做“准备”（找工具、补参数、schema 校验、<code>beforeToolCall</code>），
+      然后把允许执行的调用并发跑起来。结果消息最后按 assistant 源顺序写入上下文，
+      但 <code>tool_execution_end</code> 事件按实际完成顺序发出。
+    </p>
+    <p>
+      如果全局配置是 <code>sequential</code>，或者任意一个被调用的工具声明了
+      <code>executionMode: "sequential"</code>，整批就退化为逐个执行。这对共享内存状态、
+      文件读改写、需要独占终端的工具很重要。
+    </p>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>机制</th><th>行为</th><th>用途</th></tr></thead>
+        <tbody>
+          <tr><td><code>executionMode</code></td><td><code>"sequential"</code> 强制整批串行</td><td>文件修改、共享状态、交互式命令</td></tr>
+          <tr><td><code>terminate</code></td><td>仅当批内所有结果都设了 <code>terminate: true</code> 才提前结束</td><td>工具决定“不必再自动继续”</td></tr>
+          <tr><td><code>stopReason === "length"</code></td><td>整批工具调用都被判为失败，要求模型重发</td><td>防止执行参数被截断的“半个工具调用”</td></tr>
+          <tr><td><code>beforeToolCall</code></td><td>返回 <code>{ block: true }</code> 时生成错误 toolResult</td><td>权限、确认、审计</td></tr>
+          <tr><td><code>afterToolCall</code></td><td>按字段覆盖 content / details / isError / usage / terminate</td><td>脱敏、补充结构化结果、改错误语义</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <h3>4.5 steering、follow-up、continue：三种“继续”</h3>
+    <p>
+      很多 Agent 在流式输出时只能“打断再重来”。Pi 把继续分成三种，时机和语义都不同：
+    </p>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>方式</th><th>进入时机</th><th>典型场景</th><th>会不会拆散 tool 批次</th></tr></thead>
+        <tbody>
+          <tr><td><code>steer()</code></td><td>当前 turn 的 assistant + 工具结果都结束后，下一个请求前</td><td>用户边看边补充“顺便看下测试”</td><td>不会</td></tr>
+          <tr><td><code>followUp()</code></td><td>内层循环本来要停时，再开一个 turn</td><td>“做完这个再把文档更新了”</td><td>不会</td></tr>
+          <tr><td><code>finishTurn → continue</code></td><td><code>turn_end</code> 边界，扩展显式要求</td><td>扩展追加了 entry，需要模型再看一眼</td><td>不会</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p>
+      队列还有 <code>one-at-a-time</code> 和 <code>all</code> 两种消费模式。默认一次只取一条，
+      避免在一个 drain 点把用户连续输入的多条消息一次性灌进去，导致模型在同一轮里看到互相矛盾的指令。
+    </p>
+
+    <h3>4.6 事件序列：UI 看到的因果链</h3>
+    <p>
+      一次 run 的事件顺序是稳定的，可以据此写 UI、日志和测试：
+    </p>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>事件</th><th>时机</th><th>关键载荷</th></tr></thead>
+        <tbody>
+          <tr><td><code>agent_start</code></td><td>一次低层 run 开始</td><td>无</td></tr>
+          <tr><td><code>turn_start</code></td><td>每个 turn 开始（第一个在 agent_start 后）</td><td>无</td></tr>
+          <tr><td><code>message_start</code></td><td>用户消息、assistant 开始流式、toolResult 写入时</td><td><code>message</code></td></tr>
+          <tr><td><code>message_update</code></td><td>assistant 文本/thinking/toolcall delta</td><td><code>assistantMessageEvent</code> + partial message</td></tr>
+          <tr><td><code>message_end</code></td><td>消息定稿</td><td>最终 <code>message</code></td></tr>
+          <tr><td><code>tool_execution_start</code></td><td>每个工具调用准备执行前</td><td><code>toolCallId</code>、<code>toolName</code>、<code>args</code></td></tr>
+          <tr><td><code>tool_execution_update</code></td><td>工具通过 <code>onUpdate</code> 推流时</td><td><code>partialResult</code></td></tr>
+          <tr><td><code>tool_execution_end</code></td><td>单个工具执行并后处理完</td><td><code>result</code>、<code>isError</code>、<code>durationMs</code></td></tr>
+          <tr><td><code>turn_end</code></td><td>assistant + 全部 toolResult 写入后</td><td><code>message</code>、<code>toolResults</code></td></tr>
+          <tr><td><code>agent_end</code></td><td>低层 run 结束</td><td>本次新增的全部消息</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <figure class="diagram">
+      <svg viewBox="0 0 860 330" role="img" aria-label="四个 turn 的时间线：turn 1 和 turn 2 执行工具，steering 在 turn 1 后进入；turn 3 无工具，follow-up 后进入 turn 4。">
+        <defs>
+          <marker id="tlArrow" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+            <path d="M0,0 L10,5 L0,10 z" fill="currentColor"/>
+          </marker>
+          <marker id="tlArrowAccent" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+            <path d="M0,0 L10,5 L0,10 z" fill="var(--accent)"/>
+          </marker>
+        </defs>
+
+        <line x1="40" y1="120" x2="820" y2="120" class="dg-arrow" marker-end="url(#tlArrow)"/>
+        <text x="40" y="102" class="dg-sub">时间 →</text>
+
+        <rect x="70" y="72" width="150" height="32" rx="3" class="dg-box dg-box--accent"/>
+        <text x="145" y="92" text-anchor="middle" class="dg-label">turn 1 · assistant</text>
+        <rect x="70" y="130" width="70" height="24" rx="3" class="dg-box dg-box--soft"/>
+        <text x="105" y="146" text-anchor="middle" class="dg-sub">tool A</text>
+        <rect x="148" y="130" width="72" height="24" rx="3" class="dg-box dg-box--soft"/>
+        <text x="184" y="146" text-anchor="middle" class="dg-sub">tool B</text>
+
+        <path d="M222,120 L248,120" class="dg-arrow dg-arrow--accent" marker-end="url(#tlArrowAccent)"/>
+        <text x="226" y="106" class="dg-sub">steering</text>
+
+        <rect x="260" y="72" width="150" height="32" rx="3" class="dg-box dg-box--accent"/>
+        <text x="335" y="92" text-anchor="middle" class="dg-label">turn 2 · assistant</text>
+        <rect x="292" y="130" width="86" height="24" rx="3" class="dg-box dg-box--soft"/>
+        <text x="335" y="146" text-anchor="middle" class="dg-sub">tool C</text>
+
+        <path d="M412,120 L438,120" class="dg-arrow" marker-end="url(#tlArrow)"/>
+
+        <rect x="450" y="72" width="150" height="32" rx="3" class="dg-box"/>
+        <text x="525" y="92" text-anchor="middle" class="dg-label">turn 3 · no tools</text>
+        <text x="525" y="146" text-anchor="middle" class="dg-sub">自然停止点</text>
+
+        <path d="M602,120 L628,120" class="dg-arrow dg-arrow--accent" marker-end="url(#tlArrowAccent)"/>
+        <text x="606" y="106" class="dg-sub">follow-up</text>
+
+        <rect x="640" y="72" width="150" height="32" rx="3" class="dg-box dg-box--accent"/>
+        <text x="715" y="92" text-anchor="middle" class="dg-label">turn 4 · assistant</text>
+        <text x="715" y="146" text-anchor="middle" class="dg-sub">agent_end</text>
+
+        <line x1="40" y1="200" x2="820" y2="200" class="dg-rule"/>
+        <text x="40" y="224" class="dg-label">关键约束</text>
+        <text x="40" y="246" class="dg-sub">steering 与 follow-up 都只能在“assistant + 全部 toolResult 已写入”之后进入；</text>
+        <text x="40" y="266" class="dg-sub">循环不会把一条新用户消息插到 tool call 和它的 result 之间。</text>
+        <text x="40" y="296" class="dg-sub">turn 3 是自然停止点：没有 tool call；若队列为空且没有显式 continue，run 结束。</text>
+      </svg>
+      <figcaption>
+        一次用户请求可以跨多个 turn。steering 在 turn 1 的工具结果之后进入；follow-up 在 agent 本应停止时再把 run 拉起来。
+      </figcaption>
+    </figure>
+
+    <h3>4.7 有状态包装：Agent 类</h3>
+    <p>
+      <code>runLoop</code> 是纯执行器。<code>Agent</code> 类在它外面包了五样产品需要的东西：
+      当前 transcript、工具集、执行中的 <code>AbortController</code>、两个消息队列、监听器集合。
+      <code>processEvents()</code> 先根据事件更新内部状态，再按订阅顺序 <code>await</code> 每个监听器；
+      所以 <code>agent_end</code> 事件发出后，Agent 还要等监听器跑完才算 idle。
+    </p>
+    <p>
+      这也解释了 <code>prompt()</code> 的并发规则：同一时刻只允许一个 run。要中途输入，用
+      <code>steer()</code> 或 <code>followUp()</code> 排队，而不是再调一次 <code>prompt()</code>。
+    </p>
+
+    <!-- ============================================================ -->
+    <h2 id="hooks"><span class="h2n">05 / HOOKS</span>Hook 触发机制<a class="anchor" href="#hooks" aria-label="链接到本节">#</a></h2>
+
+    <p class="lead">
+      Pi 的“可扩展”不是一句口号，而是三层钩子：内核回调、产品事件、工具内部扩展。
+      看懂三层之间的映射，你就能准确回答：“这个钩子到底发生在 loop 的哪一步？它能改什么？改不动什么？”
+    </p>
+
+    <h3>5.1 三层钩子，各管一段</h3>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>层</th><th>接口</th><th>谁用</th><th>能力边界</th></tr></thead>
+        <tbody>
+          <tr><td>L1 内核回调</td><td><code>AgentLoopConfig</code> 里的函数</td><td><code>Agent</code> / <code>AgentSession</code> 的装配代码</td><td>直接参与循环调度；只有进程内代码能用</td></tr>
+          <tr><td>L2 产品事件</td><td><code>pi.on(event, handler)</code></td><td>扩展作者</td><td>稳定、带类型的公共 API；由 <code>AgentSession</code> 桥接到 L1</td></tr>
+          <tr><td>L3 工具内部</td><td><code>ToolDefinition</code> 字段、<code>ctx.executeTool()</code>、renderer</td><td>工具作者</td><td>影响单个工具的参数、结果、暴露方式和渲染</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <p>
+      三层不是并列的。真实链路是：扩展用 <code>pi.on()</code> 注册 L2 处理器 →
+      <code>AgentSession</code> 在构造时把若干 L1 回调挂到 <code>Agent</code> 上 →
+      L1 回调在触发时调用 <code>ExtensionRunner.emit*()</code> → 按注册顺序执行 L2 处理器。
+      所以 L2 的“触发时机”完全由 L1 决定。
+    </p>
+
+    <h3>5.2 L1：内核的九个切点</h3>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>回调</th><th>调用时机</th><th>能改变什么</th></tr></thead>
+        <tbody>
+          <tr><td><code>transformContext</code></td><td>每次请求前，<code>convertToLlm</code> 之前</td><td><code>AgentMessage[]</code>：裁剪、注入、重排</td></tr>
+          <tr><td><code>convertToLlm</code></td><td>每次请求前，<code>StreamFn</code> 之前</td><td>转成 provider 消息；过滤 UI-only 消息</td></tr>
+          <tr><td><code>getApiKey</code></td><td>每次请求前</td><td>动态取短期 token</td></tr>
+          <tr><td><code>prepareRequest</code></td><td>每次请求前，pending 消息已追加</td><td>替换 context / model / thinking；不轮询队列</td></tr>
+          <tr><td><code>prepareNextTurn</code></td><td>上一 turn 结束、下一 turn 开始前</td><td>替换 context / model / thinking，或追加消息</td></tr>
+          <tr><td><code>finishTurn</code></td><td>assistant + 工具结果写入后、<code>turn_end</code> 前</td><td>返回 <code>{ action: "continue" | "end" }</code></td></tr>
+          <tr><td><code>beforeToolCall</code></td><td>参数校验后、执行前</td><td>阻止执行、给原因、标记 terminate</td></tr>
+          <tr><td><code>afterToolCall</code></td><td>执行后、发出结果前</td><td>覆盖 content / details / isError / usage / terminate</td></tr>
+          <tr><td><code>getSteeringMessages</code><br><code>getFollowUpMessages</code></td><td>turn 结束后 / run 将停时</td><td>把排队消息送回循环</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <div class="callout">
+      <span class="callout__label">三个“下一次”不要混</span>
+      <p>
+        <code>prepareRequest</code> 是“每次模型请求前”，包括第一个；<code>prepareNextTurn</code> 是“这一轮结束、确定还要继续时”；
+        <code>finishTurn</code> 是“这一轮刚做完，决定要不要继续”。前两者改状态，后者做决策。
+      </p>
+    </div>
+
+    <h3>5.3 L2：扩展事件全景</h3>
+    <p>
+      扩展通过默认导出的工厂函数拿到 <code>ExtensionAPI</code>，用 <code>pi.on()</code> 注册。
+      下表按生命周期分组，是本章最值得收藏的一页。标记为“通知”的事件返回值被忽略；
+      标记为“变换/闸门”的事件会改变后续行为。
+    </p>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>事件</th><th>触发点</th><th>类型</th><th>你能做什么</th></tr></thead>
+        <tbody>
+          <tr><td><code>input</code></td><td>prompt 进入产品层，展开模板之前</td><td>变换 / 闸门</td><td>改写文本或图片；返回 <code>handled</code> 直接消费输入</td></tr>
+          <tr><td><code>before_agent_start</code></td><td>每次 run 准备阶段</td><td>变换</td><td>改 prompt sections、追加消息、强制系统提示、调整工具</td></tr>
+          <tr><td><code>agent_start</code></td><td>低层 run 开始</td><td>通知</td><td>计时、日志、初始化本次 run 的状态</td></tr>
+          <tr><td><code>agent_end</code></td><td>低层 run 结束</td><td>通知</td><td>观察本次新增消息；注意之后可能还有重试/继续</td></tr>
+          <tr><td><code>turn_start</code></td><td>每个 turn 开始</td><td>通知</td><td>拿到 <code>turnIndex</code>、时间戳</td></tr>
+          <tr><td><code>turn_end</code></td><td>assistant + 工具结果都写入后</td><td>边界</td><td>追加 <code>custom</code> / <code>custom_message</code> / <code>context_edit</code> / <code>compaction</code> entry；要求再跑一次</td></tr>
+          <tr><td><code>context</code></td><td>每次请求前，<code>transformContext</code> 内</td><td>链式变换</td><td>只看非 system 消息；裁剪、注入上下文</td></tr>
+          <tr><td><code>context_with_system</code></td><td>紧随 <code>context</code> 之后</td><td>链式变换</td><td>看完整 transcript；返回即作为请求内容，必须保留 index 0 的 system</td></tr>
+          <tr><td><code>before_provider_headers</code></td><td>请求头组装后、HTTP 前</td><td>原地修改</td><td>注入 tracing / session header；<code>null</code> 删除</td></tr>
+          <tr><td><code>before_provider_request</code></td><td>请求体序列化前</td><td>链式变换</td><td>替换 provider payload</td></tr>
+          <tr><td><code>after_provider_response</code></td><td>收到响应、消费流之前</td><td>通知</td><td>记录 status / headers</td></tr>
+          <tr><td><code>provider_stream_event</code></td><td>每个 provider 流事件归一化前</td><td>通知</td><td>调试原始事件；慢处理器会拖慢流</td></tr>
+          <tr><td><code>message_start</code></td><td>任何消息开始（user / assistant / toolResult）</td><td>通知</td><td>UI 或日志</td></tr>
+          <tr><td><code>message_update</code></td><td>assistant 流式增量</td><td>通知</td><td>拿到 <code>assistantMessageEvent</code>；不要做慢操作</td></tr>
+          <tr><td><code>message_end</code></td><td>消息定稿</td><td>变换</td><td>替换同 role 的最终消息（脱敏、补字段）</td></tr>
+          <tr><td><code>tool_execution_start</code></td><td>工具开始执行</td><td>通知</td><td>观察参数；嵌套调用带 <code>parentToolCallId</code></td></tr>
+          <tr><td><code>tool_call</code></td><td>参数校验后、执行前</td><td>闸门 / 原地修改</td><td>改 <code>event.input</code>；返回 <code>{ block, reason }</code> 阻止</td></tr>
+          <tr><td><code>tool_execution_update</code></td><td>工具推流部分结果</td><td>通知</td><td>展示长任务进度</td></tr>
+          <tr><td><code>tool_result</code></td><td>工具执行后、发出结果前</td><td>链式变换</td><td>改 content / details / structuredContent / isError / usage</td></tr>
+          <tr><td><code>tool_execution_end</code></td><td>单个工具完全结束</td><td>通知</td><td>记录耗时、错误、结果</td></tr>
+          <tr><td><code>agent_before_settle</code></td><td>没有自动继续、最终 settle 前</td><td>边界</td><td>追加 entry；要求最后一次 continuation</td></tr>
+          <tr><td><code>agent_settled</code></td><td>彻底空闲</td><td>通知</td><td>通知类工作、清理；这是“真的结束了”</td></tr>
+          <tr><td><code>session_start</code> / <code>session_shutdown</code></td><td>会话创建 / 销毁</td><td>生命周期</td><td>初始化/释放 session 级资源</td></tr>
+          <tr><td><code>session_before_switch</code><br><code>session_before_fork</code><br><code>session_before_compact</code><br><code>session_before_tree</code></td><td>对应操作之前</td><td>闸门</td><td>返回 <code>{ cancel: true }</code> 取消操作</td></tr>
+          <tr><td><code>session_compact</code> / <code>session_compact_failed</code></td><td>压缩完成/失败</td><td>通知</td><td>记录摘要、失败诊断</td></tr>
+          <tr><td><code>session_tree</code></td><td>树导航完成</td><td>通知</td><td>同步 UI 或扩展状态</td></tr>
+          <tr><td><code>project_trust</code></td><td>项目资源加载前</td><td>闸门</td><td>决定是否信任项目级扩展/设置</td></tr>
+          <tr><td><code>resources_discover</code></td><td>session 启动后</td><td>变换</td><td>追加 skill / prompt / theme 路径</td></tr>
+          <tr><td><code>model_select</code> / <code>thinking_level_select</code></td><td>用户切换模型/思考级别</td><td>通知</td><td>记录选择、更新 UI</td></tr>
+          <tr><td><code>user_bash</code></td><td>用户输入 <code>!</code> 命令</td><td>闸门</td><td>接管执行（远程/沙箱）或返回结果</td></tr>
+          <tr><td><code>cache_warming_decision</code></td><td>空闲时准备预热 prompt cache</td><td>最后覆盖</td><td>返回 <code>warm</code> / <code>stop</code>；最后一个有效</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <h3>5.4 顺序、组合与失败语义</h3>
+    <p>
+      处理器按“扩展加载顺序 + 注册顺序”执行；每次 dispatch 开始时对处理器列表做快照，
+      所以在处理器里取消订阅不会影响正在进行的这一轮。不同类型的事件有不同的组合方式：
+    </p>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>模式</th><th>行为</th><th>典型事件</th></tr></thead>
+        <tbody>
+          <tr><td>通知</td><td>返回值被忽略，按顺序 await</td><td><code>message_update</code>、<code>tool_execution_start</code></td></tr>
+          <tr><td>原地修改</td><td>后续处理器看到前面的改动</td><td><code>before_provider_headers</code>、<code>tool_call.input</code></td></tr>
+          <tr><td>链式变换</td><td>后一个处理器收到前一个的返回值</td><td><code>context</code>、<code>message_end</code>、<code>tool_result</code></td></tr>
+          <tr><td>闸门</td><td>一旦拦截/取消，后续正常路径停止</td><td><code>tool_call</code>、<code>input</code>、<code>session_before_*</code></td></tr>
+          <tr><td>边界决策</td><td>每个处理器看到当前累积的 entries 和 continue 决策</td><td><code>turn_end</code>、<code>agent_before_settle</code></td></tr>
+          <tr><td>最后覆盖</td><td>最后一个返回动作的处理器生效</td><td><code>cache_warming_decision</code></td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p>
+      失败策略也按事件分级：普通处理器抛错会被记录并继续；<code>tool_call</code> 处理器抛错会
+      <strong>阻止工具执行</strong>（fail closed）；工具本身的执行错误会变成模型可见的 error result。
+      <code>context</code> 处理器抛错时保留上一版消息，不会让整个请求崩掉。
+    </p>
+
+    <div class="callout callout--warn">
+      <span class="callout__label">两个常见坑</span>
+      <p>
+        第一，<code>turn_end</code> 和 <code>agent_before_settle</code> 里“无条件 continue”会造成死循环；
+        必须把 continuation 条件写清楚。第二，<code>agent_end</code> 不是最终空闲信号；
+        重试、压缩、队列都可能让它再跑起来，通知类逻辑请挂到 <code>agent_settled</code>。
+      </p>
+    </div>
+
+    <h3>5.5 一次 turn 里，钩子按什么顺序触发</h3>
+    <figure class="diagram">
+      <svg viewBox="0 0 720 540" role="img" aria-label="一次 turn 的钩子顺序：输入与 run、模型请求、消息与工具、turn 边界与 settle。">
+        <defs>
+          <marker id="hkArrow" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="5" markerHeight="5" orient="auto-start-reverse">
+            <path d="M0,0 L10,5 L0,10 z" fill="currentColor"/>
+          </marker>
+        </defs>
+
+        <text x="20" y="22" class="dg-num">01 / INPUT &amp; RUN</text>
+        <rect x="20" y="34" width="100" height="38" rx="3" class="dg-box dg-box--accent"/>
+        <text x="70" y="58" text-anchor="middle" class="dg-label">input</text>
+        <rect x="132" y="34" width="170" height="38" rx="3" class="dg-box"/>
+        <text x="217" y="58" text-anchor="middle" class="dg-label">before_agent_start</text>
+        <rect x="314" y="34" width="120" height="38" rx="3" class="dg-box dg-box--soft"/>
+        <text x="374" y="58" text-anchor="middle" class="dg-label">agent_start</text>
+        <rect x="446" y="34" width="110" height="38" rx="3" class="dg-box dg-box--soft"/>
+        <text x="501" y="58" text-anchor="middle" class="dg-label">turn_start</text>
+
+        <path d="M120,53 L128,53" class="dg-arrow" marker-end="url(#hkArrow)"/>
+        <path d="M302,53 L310,53" class="dg-arrow" marker-end="url(#hkArrow)"/>
+        <path d="M434,53 L442,53" class="dg-arrow" marker-end="url(#hkArrow)"/>
+        <path d="M12,72 L12,118" class="dg-arrow dg-arrow--accent" marker-end="url(#hkArrow)"/>
+
+        <text x="20" y="110" class="dg-num">02 / MODEL REQUEST</text>
+        <rect x="20" y="122" width="110" height="38" rx="3" class="dg-box dg-box--accent"/>
+        <text x="75" y="146" text-anchor="middle" class="dg-label">context</text>
+        <rect x="142" y="122" width="190" height="38" rx="3" class="dg-box dg-box--accent"/>
+        <text x="237" y="146" text-anchor="middle" class="dg-label">context_with_system</text>
+        <rect x="344" y="122" width="210" height="38" rx="3" class="dg-box dg-box--soft"/>
+        <text x="449" y="146" text-anchor="middle" class="dg-label">before_provider_headers</text>
+
+        <rect x="20" y="176" width="210" height="38" rx="3" class="dg-box dg-box--soft"/>
+        <text x="125" y="200" text-anchor="middle" class="dg-label">before_provider_request</text>
+        <rect x="242" y="176" width="210" height="38" rx="3" class="dg-box dg-box--soft"/>
+        <text x="347" y="200" text-anchor="middle" class="dg-label">after_provider_response</text>
+        <rect x="464" y="176" width="200" height="38" rx="3" class="dg-box dg-box--soft"/>
+        <text x="564" y="200" text-anchor="middle" class="dg-label">provider_stream_event</text>
+
+        <path d="M130,141 L138,141" class="dg-arrow" marker-end="url(#hkArrow)"/>
+        <path d="M332,141 L340,141" class="dg-arrow" marker-end="url(#hkArrow)"/>
+        <path d="M230,195 L238,195" class="dg-arrow" marker-end="url(#hkArrow)"/>
+        <path d="M452,195 L460,195" class="dg-arrow" marker-end="url(#hkArrow)"/>
+        <path d="M12,218 L12,260" class="dg-arrow dg-arrow--accent" marker-end="url(#hkArrow)"/>
+
+        <text x="20" y="252" class="dg-num">03 / MESSAGES &amp; TOOLS</text>
+        <rect x="20" y="264" width="140" height="38" rx="3" class="dg-box dg-box--soft"/>
+        <text x="90" y="288" text-anchor="middle" class="dg-label">message_start</text>
+        <rect x="172" y="264" width="150" height="38" rx="3" class="dg-box dg-box--soft"/>
+        <text x="247" y="288" text-anchor="middle" class="dg-label">message_update</text>
+        <rect x="334" y="264" width="130" height="38" rx="3" class="dg-box dg-box--soft"/>
+        <text x="399" y="288" text-anchor="middle" class="dg-label">message_end</text>
+        <rect x="476" y="264" width="210" height="38" rx="3" class="dg-box dg-box--accent"/>
+        <text x="581" y="288" text-anchor="middle" class="dg-label">tool_execution_start</text>
+
+        <rect x="20" y="318" width="110" height="38" rx="3" class="dg-box dg-box--accent"/>
+        <text x="75" y="342" text-anchor="middle" class="dg-label">tool_call</text>
+        <rect x="142" y="318" width="200" height="38" rx="3" class="dg-box dg-box--soft"/>
+        <text x="242" y="342" text-anchor="middle" class="dg-label">tool_execution_update</text>
+        <rect x="354" y="318" width="120" height="38" rx="3" class="dg-box dg-box--accent"/>
+        <text x="414" y="342" text-anchor="middle" class="dg-label">tool_result</text>
+        <rect x="486" y="318" width="200" height="38" rx="3" class="dg-box dg-box--soft"/>
+        <text x="586" y="342" text-anchor="middle" class="dg-label">tool_execution_end</text>
+
+        <path d="M160,283 L168,283" class="dg-arrow" marker-end="url(#hkArrow)"/>
+        <path d="M322,283 L330,283" class="dg-arrow" marker-end="url(#hkArrow)"/>
+        <path d="M464,283 L472,283" class="dg-arrow" marker-end="url(#hkArrow)"/>
+        <path d="M130,337 L138,337" class="dg-arrow" marker-end="url(#hkArrow)"/>
+        <path d="M342,337 L350,337" class="dg-arrow" marker-end="url(#hkArrow)"/>
+        <path d="M474,337 L482,337" class="dg-arrow" marker-end="url(#hkArrow)"/>
+        <path d="M12,360 L12,398" class="dg-arrow dg-arrow--accent" marker-end="url(#hkArrow)"/>
+
+        <text x="20" y="390" class="dg-num">04 / TURN BOUNDARY &amp; SETTLE</text>
+        <rect x="20" y="402" width="120" height="38" rx="3" class="dg-box dg-box--accent"/>
+        <text x="80" y="426" text-anchor="middle" class="dg-label">turn_end</text>
+        <rect x="152" y="402" width="120" height="38" rx="3" class="dg-box dg-box--soft"/>
+        <text x="212" y="426" text-anchor="middle" class="dg-label">agent_end</text>
+        <rect x="284" y="402" width="190" height="38" rx="3" class="dg-box dg-box--soft"/>
+        <text x="379" y="426" text-anchor="middle" class="dg-label">agent_before_settle</text>
+        <rect x="486" y="402" width="150" height="38" rx="3" class="dg-box dg-box--soft"/>
+        <text x="561" y="426" text-anchor="middle" class="dg-label">agent_settled</text>
+
+        <path d="M140,421 L148,421" class="dg-arrow" marker-end="url(#hkArrow)"/>
+        <path d="M272,421 L280,421" class="dg-arrow" marker-end="url(#hkArrow)"/>
+        <path d="M474,421 L482,421" class="dg-arrow" marker-end="url(#hkArrow)"/>
+
+        <line x1="20" y1="468" x2="700" y2="468" class="dg-rule"/>
+        <text x="20" y="492" class="dg-sub">阅读顺序：每个阶段内从左到右，阶段之间从上到下。</text>
+        <text x="20" y="512" class="dg-sub">消息事件覆盖 user / assistant / toolResult；工具批内可能有多个调用并行执行。</text>
+      </svg>
+      <figcaption>
+        同一张图可以当排查顺序用：钩子没触发，先确认它在哪个阶段；钩子触发了但结果没生效，先确认它是通知还是变换/闸门。
+      </figcaption>
+    </figure>
+
+    <h3>5.6 三个最小可用例子</h3>
+    <p>
+      下面三个例子覆盖了扩展最常用的三种能力：拦截、改写上下文、裁剪工具结果。它们都是独立的
+      <code>~/.pi/agent/extensions/*.ts</code> 文件，启动时自动加载。
+    </p>
+
+    <div class="code-cap"><span>权限闸门：tool_call</span><span>阻止危险命令</span></div>
+<pre><code><span class="k">import</span> type { ExtensionAPI } <span class="k">from</span> <span class="s">"@earendil-works/pi-coding-agent"</span>;
+
+<span class="k">export default function</span> (pi: ExtensionAPI) {
+  pi.on(<span class="s">"tool_call"</span>, <span class="k">async</span> (event, ctx) =&gt; {
+    <span class="k">if</span> (event.toolName !== <span class="s">"bash"</span>) <span class="k">return</span>;
+    <span class="k">const</span> command = String(event.input.command ?? <span class="s">""</span>);
+    <span class="k">if</span> (!command.includes(<span class="s">"rm -rf"</span>)) <span class="k">return</span>;
+
+    <span class="k">const</span> ok = <span class="k">await</span> ctx.ui.confirm(<span class="s">"执行危险命令?"</span>, command);
+    <span class="k">if</span> (!ok) <span class="k">return</span> { block: <span class="k">true</span>, reason: <span class="s">"用户拒绝执行"</span> };
+  });
+}</code></pre>
+
+    <div class="code-cap"><span>改系统提示：before_agent_start</span><span>追加团队约定</span></div>
+<pre><code>pi.on(<span class="s">"before_agent_start"</span>, (event) =&gt; {
+  <span class="c">// 优先改 sections，而不是整段替换；这样 transcript 只记录差异</span>
+  event.systemPromptOptions.sections = {
+    ...event.systemPromptOptions.sections,
+    team: <span class="s">"&lt;team&gt;提交前必须运行 npm run check。&lt;/team&gt;"</span>,
+  };
+});</code></pre>
+
+    <div class="code-cap"><span>裁剪结果：tool_result</span><span>脱敏 + 截断</span></div>
+<pre><code>pi.on(<span class="s">"tool_result"</span>, (event) =&gt; {
+  <span class="k">if</span> (event.toolName !== <span class="s">"bash"</span>) <span class="k">return</span>;
+  <span class="k">const</span> text = event.content
+    .filter((block) =&gt; block.type === <span class="s">"text"</span>)
+    .map((block) =&gt; block.text)
+    .join(<span class="s">"\n"</span>)
+    .replace(/sk-[A-Za-z0-9]+/g, <span class="s">"sk-***"</span>);
+
+  <span class="k">return</span> {
+    content: [{ type: <span class="s">"text"</span>, text: text.slice(0, <span class="f">20000</span>) }],
+    isError: event.isError,
+  };
+});</code></pre>
+
+    <h3>5.7 扩展的生命周期与信任边界</h3>
+    <p>
+      扩展是 TypeScript 模块，通过 <code>jiti</code> 直接加载，跑在 Pi 进程内，拥有和 Pi 一样的操作系统权限。
+      它能看到 prompt、工具调用、文件、凭据和会话历史。因此 Pi 不把它当沙箱，而把它当“你信任的代码”。
+    </p>
+    <ul>
+      <li>工厂函数里不要启动进程、socket、watcher 或定时器；有些命令只加载扩展，不启动会话。</li>
+      <li>长生命周期资源放到 <code>session_start</code> 创建，<code>session_shutdown</code> 幂等释放。</li>
+      <li>项目级扩展要先经过 <code>project_trust</code>；不可信项目不要自动加载。</li>
+      <li>需要强隔离时，用容器或 micro-VM 跑整个 Pi 进程，而不是指望扩展自己“守规矩”。</li>
+    </ul>
+
+    <!-- ============================================================ -->
+    <h2 id="infra"><span class="h2n">06 / AGENT INFRA</span>Agent Infra 全景<a class="anchor" href="#infra" aria-label="链接到本节">#</a></h2>
+
+    <p class="lead">
+      循环只有几百行，真正让 Agent 可用的是外围基础设施：工具怎么执行、上下文怎么组装、会话怎么持久化、
+      模型差异怎么隔离、UI 怎么复用。这一节按“数据从哪来、到哪去”串起来。
+    </p>
+
+    <h3>6.1 工具系统：契约、执行、输出预算</h3>
+    <p>
+      工具不是插件黑盒，而是一份显式契约：名字、给模型看的描述、TypeBox 参数 schema、
+      <code>execute()</code> 函数，以及可选的输出 schema、执行模式、暴露方式和渲染器。
+      内核只依赖 <code>AgentTool</code>，产品层用 <code>ToolDefinition</code> 补充提示词片段、渲染和 UI 元数据。
+    </p>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>内置工具</th><th>做什么</th><th>关键机制</th></tr></thead>
+        <tbody>
+          <tr><td><code>read</code></td><td>读文本/图片</td><td>默认截断 2000 行或 50KB；<code>offset</code>/<code>limit</code> 继续读；图片自动缩放</td></tr>
+          <tr><td><code>bash</code></td><td>执行 shell 命令</td><td>流式输出、超时、整棵进程树 kill、输出累积器、完整输出落文件</td></tr>
+          <tr><td><code>edit</code></td><td>精确文本替换</td><td>多段不重叠编辑、按原始文件匹配、生成 diff、文件修改队列</td></tr>
+          <tr><td><code>write</code></td><td>创建/覆盖文件</td><td>同样走文件修改队列，避免并发写互相踩</td></tr>
+          <tr><td><code>grep</code> / <code>find</code> / <code>ls</code></td><td>搜索与列目录</td><td>只读工具，适合关闭 bash 时提供文件探索能力</td></tr>
+          <tr><td><code>powershell</code></td><td>Windows 命令</td><td>与 bash 共享操作接口，平台差异留在 operations 层</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p>
+      两个设计值得抄：第一，<strong>工具结果有预算</strong>。默认 2000 行 / 50KB，超出就截断，
+      并把完整输出路径告诉模型。上下文是有限资源，工具必须主动管理自己的输出。
+      第二，<strong>操作可注入</strong>。<code>read</code>、<code>bash</code>、<code>edit</code> 都把文件系统操作抽象成
+      <code>Operations</code>，因此可以在 SSH、容器、micro-VM 里复用同一套工具语义。
+    </p>
+    <p>
+      工具还有“暴露方式”这一层：<code>direct</code> 直接声明给模型；<code>model-only</code> 只声明不可嵌套调用；
+      <code>codemode</code> 只能从脚本里调用；<code>deferred</code> 由 <code>tool_search</code> 发现；
+      <code>hidden</code> 注册但不可达。这让一个 Agent 可以注册上百个工具，只在需要时把少数几个放进上下文。
+    </p>
+
+    <h3>6.2 上下文：提示词、工具装载与压缩</h3>
+    <p>
+      上下文不是“把历史消息拼起来”这么简单。Pi 把它拆成四个可独立变化的部分：
+    </p>
+    <div class="cards-2">
+      <div class="mini-card">
+        <h4>System prompt sections</h4>
+        <p><code>preamble</code>、<code>tools</code>、<code>rules</code>、<code>docs</code>、<code>project_context</code>、<code>skills</code>、<code>cwd</code>，以及扩展追加的命名 section。</p>
+      </div>
+      <div class="mini-card">
+        <h4>Tool loadout</h4>
+        <p>模型看到的工具声明与运行时能执行的工具分开管理；差异用 <code>toolsAdded</code> / <code>toolsRemoved</code> 写进 system message。</p>
+      </div>
+      <div class="mini-card">
+        <h4>Conversation</h4>
+        <p>active branch 上的消息；自定义消息在 <code>convertToLlm</code> 时映射成 provider 能理解的角色。</p>
+      </div>
+      <div class="mini-card">
+        <h4>Skills / templates</h4>
+        <p>Skill 描述常驻提示词，完整说明按需读取；prompt template 在输入进入 Agent 前展开。</p>
+      </div>
+    </div>
+    <p>
+      每次 run 开始时，<code>_prepareRun()</code> 会比较“想要的 section / 工具”和 transcript 里
+      “模型当前看到的”，只追加差异补丁。这样恢复会话、切换模型、扩展改提示词都不需要重写整段历史，
+      也不会破坏 provider 的缓存前缀。
+    </p>
+    <p>
+      当上下文接近模型窗口时，<code>prepareRequest</code> 会触发压缩：用一次额外的模型调用生成摘要，
+      追加一个 <code>compaction</code> entry，记录 <code>firstKeptEntryId</code> 和压缩边界处的系统提示。
+      之后构建上下文时，旧消息被摘要替代，原始 entry 仍留在会话树里，随时可以回看或分支。
+    </p>
+    <div class="callout">
+      <span class="callout__label">为什么要压缩</span>
+      <p>
+        模型窗口是硬限制，工具输出又天然膨胀。压缩不是“优化”，而是长会话能继续工作的前提。
+        Pi 把压缩做成会话树上的一个普通 entry，因此它可持久化、可分支、可被扩展审计，而不是一次性的内存操作。
+      </p>
+    </div>
+
+    <h3>6.3 会话：JSONL 里的消息树</h3>
+    <p>
+      会话文件是 JSONL，每行一个 entry。除了第一行 header，每个 entry 都有 <code>id</code> 和
+      <code>parentId</code>，因此整段对话是一棵树，而不是一条线。当前 leaf 决定 active branch；
+      fork / clone 只是换一个 leaf 或复制一段路径，不会删除旧分支。
+    </p>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>Entry</th><th>作用</th><th>是否进入模型上下文</th></tr></thead>
+        <tbody>
+          <tr><td><code>message</code></td><td>user / assistant / toolResult / system 消息</td><td>是（system 负责提示词与工具声明）</td></tr>
+          <tr><td><code>model_change</code></td><td>记录模型切换</td><td>否，但决定后续请求的模型</td></tr>
+          <tr><td><code>thinking_level_change</code></td><td>记录思考级别</td><td>否</td></tr>
+          <tr><td><code>usage</code></td><td>非消息的用量（如 cache warming）</td><td>否，只计入统计</td></tr>
+          <tr><td><code>compaction</code></td><td>摘要 + <code>firstKeptEntryId</code> + 系统提示快照</td><td>是，替代更早的消息</td></tr>
+          <tr><td><code>branch_summary</code></td><td>从另一个分支返回时的摘要</td><td>是</td></tr>
+          <tr><td><code>custom</code></td><td>扩展私有数据</td><td>否</td></tr>
+          <tr><td><code>custom_message</code></td><td>扩展注入的消息</td><td>是，转成 user 消息</td></tr>
+          <tr><td><code>context_edit</code></td><td>对早期 entry 的追加式修改/隐藏</td><td>是，投影时应用</td></tr>
+          <tr><td><code>label</code> / <code>session_info</code></td><td>书签、显示名</td><td>否</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <figure class="diagram diagram--narrow">
+      <svg viewBox="0 0 560 330" role="img" aria-label="会话树：主线从用户消息到 assistant、工具结果；在较早的 assistant 处分叉出另一个分支；压缩 entry 替代更早的消息。">
+        <defs>
+          <marker id="treeArrow" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+            <path d="M0,0 L10,5 L0,10 z" fill="currentColor"/>
+          </marker>
+        </defs>
+        <rect x="22" y="26" width="120" height="34" rx="3" class="dg-box"/>
+        <text x="82" y="47" text-anchor="middle" class="dg-label">session header</text>
+        <rect x="22" y="86" width="120" height="34" rx="3" class="dg-box dg-box--soft"/>
+        <text x="82" y="107" text-anchor="middle" class="dg-label">user</text>
+        <rect x="22" y="146" width="120" height="34" rx="3" class="dg-box dg-box--soft"/>
+        <text x="82" y="167" text-anchor="middle" class="dg-label">assistant</text>
+        <rect x="22" y="206" width="120" height="34" rx="3" class="dg-box dg-box--soft"/>
+        <text x="82" y="227" text-anchor="middle" class="dg-label">toolResult</text>
+        <rect x="22" y="266" width="120" height="34" rx="3" class="dg-box dg-box--accent"/>
+        <text x="82" y="287" text-anchor="middle" class="dg-label">compaction</text>
+
+        <path d="M82,60 L82,82" class="dg-arrow" marker-end="url(#treeArrow)"/>
+        <path d="M82,120 L82,142" class="dg-arrow" marker-end="url(#treeArrow)"/>
+        <path d="M82,180 L82,202" class="dg-arrow" marker-end="url(#treeArrow)"/>
+
+        <rect x="210" y="86" width="120" height="34" rx="3" class="dg-box"/>
+        <text x="270" y="107" text-anchor="middle" class="dg-label">assistant</text>
+        <rect x="210" y="146" width="120" height="34" rx="3" class="dg-box"/>
+        <text x="270" y="167" text-anchor="middle" class="dg-label">toolResult</text>
+        <rect x="210" y="206" width="120" height="34" rx="3" class="dg-box"/>
+        <text x="270" y="227" text-anchor="middle" class="dg-label">assistant</text>
+
+        <path d="M82,103 C140,103 160,103 206,103" class="dg-arrow dg-arrow--dashed" marker-end="url(#treeArrow)"/>
+        <text x="132" y="94" class="dg-sub">fork</text>
+        <path d="M270,120 L270,142" class="dg-arrow" marker-end="url(#treeArrow)"/>
+        <path d="M270,180 L270,202" class="dg-arrow" marker-end="url(#treeArrow)"/>
+
+        <rect x="390" y="146" width="140" height="34" rx="3" class="dg-box dg-box--accent"/>
+        <text x="460" y="167" text-anchor="middle" class="dg-label">active leaf</text>
+        <path d="M330,223 C370,223 370,180 386,166" class="dg-arrow dg-arrow--accent" marker-end="url(#treeArrow)"/>
+        <text x="342" y="214" class="dg-sub">resume</text>
+
+        <text x="210" y="290" class="dg-sub">被压缩的旧消息仍在树里，</text>
+        <text x="210" y="308" class="dg-sub">只是不再进入模型上下文。</text>
+      </svg>
+      <figcaption>
+        active branch 由当前 leaf 决定。分叉不删除旧路径；压缩只是在投影时用摘要替代一段旧消息。
+      </figcaption>
+    </figure>
+
+    <p>
+      <code>SessionManager</code> 负责 I/O 与树操作，<code>buildSessionProjection()</code> 负责把
+      “当前 leaf 的路径 + 压缩 + context edit”投影成模型消息。这个“追加式存储 + 派生投影”的设计，
+      是 Pi 能同时支持恢复、分叉、压缩和可审计修改的关键。
+    </p>
+
+    <h3>6.4 模型层：一个接口，很多协议</h3>
+    <p>
+      <code>pi-ai</code> 把不同厂商的 API 差异收在 provider adapter 里，上游只看到统一的
+      <code>Model</code>、<code>TranscriptContext</code> 和 <code>AssistantMessageEventStream</code>。
+      一次 <code>streamSimple()</code> 的职责包括：选 API、处理鉴权、拼请求、解析流、把厂商事件归一化成
+      <code>text_delta</code> / <code>thinking_delta</code> / <code>toolcall_delta</code> / <code>done</code> / <code>error</code>。
+    </p>
+    <ul>
+      <li><strong>模型目录</strong>：provider、api、context window、max tokens、价格、是否支持 reasoning / image，都是数据，不是 if-else。</li>
+      <li><strong>鉴权</strong>：API key、OAuth、环境变量、credential store；每次请求都可以重新解析，适配会过期的 token。</li>
+      <li><strong>重试与超时</strong>：在 adapter 层做，带可配置的 retry delay 上限；上层只看到最终消息或 error。</li>
+      <li><strong>虚拟模型</strong>：产品层可以把“分类器 + 主模型”包装成一个可选模型，按请求路由；路由逻辑不污染 loop。</li>
+      <li><strong>缓存预热</strong>：空闲时用相同前缀发一个轻量请求，提升下一轮的 prompt cache 命中率；可被扩展否决。</li>
+    </ul>
+
+    <h3>6.5 运行模式与 UI：同一颗心脏，四种外壳</h3>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>模式</th><th>输入/输出</th><th>适合</th><th>实现位置</th></tr></thead>
+        <tbody>
+          <tr><td>Interactive</td><td>终端 TUI，流式渲染</td><td>人机协作</td><td><code>modes/interactive/</code></td></tr>
+          <tr><td>Print</td><td>一次性文本输出</td><td>脚本、CI</td><td><code>modes/print-mode.ts</code></td></tr>
+          <tr><td>JSON</td><td>JSONL 事件流</td><td>被其他程序消费</td><td><code>modes/json-event.ts</code></td></tr>
+          <tr><td>RPC</td><td>stdin JSONL 命令 / stdout 事件</td><td>跨语言、进程隔离</td><td><code>modes/rpc/</code></td></tr>
+          <tr><td>SDK</td><td>进程内 TypeScript API</td><td>嵌入应用</td><td><code>core/sdk.ts</code></td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p>
+      四种模式共享 <code>AgentSession</code>，所以“会话、压缩、扩展、工具”的行为一致，差异只在 I/O。
+      TUI 自己实现了差分渲染和同步输出，只重绘变化的行，避免整屏闪烁；扩展可以通过 <code>ctx.ui</code>
+      提供对话框、通知、状态栏和自定义组件，但非交互模式要能优雅降级。
+    </p>
+
+    <h3>6.6 外围包：什么时候需要它们</h3>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>包</th><th>解决的问题</th><th>什么时候读</th></tr></thead>
+        <tbody>
+          <tr><td><code>pi-codemode</code></td><td>模型写 JS 脚本，在 QuickJS-WASM 里调用工具；只有脚本输出进入上下文</td><td>工具太多、想减少上下文占用时</td></tr>
+          <tr><td><code>pi-mcp</code></td><td>接入 MCP server 的工具/资源</td><td>需要外部工具生态时</td></tr>
+          <tr><td><code>pi-durable</code></td><td>先落盘再展示，进程崩溃后可恢复</td><td>长任务、服务端 Agent</td></tr>
+          <tr><td><code>pi-env</code></td><td>通过 SSH 在远端执行工具</td><td>本地无环境、需要远程 GPU/容器</td></tr>
+          <tr><td><code>chord</code></td><td>跨进程对象、热重载、RPC</td><td>构建可热更新的 Agent 服务</td></tr>
+          <tr><td><code>pi-telemetry</code></td><td>厂商无关的 trace/span 契约</td><td>接入观测平台</td></tr>
+          <tr><td><code>pi-evals</code></td><td>可重复的评测</td><td>改 prompt/工具后做回归</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <!-- ============================================================ -->
+    <h2 id="lessons"><span class="h2n">07 / DESIGN NOTES</span>设计取舍与可迁移结论<a class="anchor" href="#lessons" aria-label="链接到本节">#</a></h2>
+
+    <p class="lead">
+      Pi 不是“功能最全”的 Agent，它的价值在于把边界画得很清楚。下面这些结论，换到任何 Agent 实现都成立。
+    </p>
+
+    <h3>7.1 八条可迁移的设计结论</h3>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>#</th><th>结论</th><th>在 Pi 里的证据</th></tr></thead>
+        <tbody>
+          <tr><td>01</td><td>内核和产品分开，内核不依赖产品</td><td><code>pi-agent-core</code> 只有 2.5k 行，不知道会话/CLI/扩展的存在</td></tr>
+          <tr><td>02</td><td>消息是唯一稳定接口</td><td>loop 输入输出都是 <code>AgentMessage</code>；只在 provider 边界转换</td></tr>
+          <tr><td>03</td><td>一个循环，多个切点</td><td>产品通过 <code>AgentLoopConfig</code> 注入行为，不 fork 循环</td></tr>
+          <tr><td>04</td><td>以 turn 为调度单位</td><td>steering、压缩、turn_end、工具结果都按 turn 对齐</td></tr>
+          <tr><td>05</td><td>队列代替中断</td><td>steering / follow-up 在安全边界注入，不拆散工具批次</td></tr>
+          <tr><td>06</td><td>上下文是预算，不是垃圾桶</td><td>工具输出截断、compaction、tool exposure、skills 按需加载</td></tr>
+          <tr><td>07</td><td>持久化“定稿”，不持久化“流”</td><td>partial 只在内存；<code>message_end</code> 才 append</td></tr>
+          <tr><td>08</td><td>信任边界是进程，不是循环</td><td>扩展与工具拥有同等 OS 权限；权限是产品/扩展职责</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <h3>7.2 Pi 主动放弃的东西</h3>
+    <p>
+      这些“没有”不是遗漏，而是产品定位：默认保持最小，让用户用扩展补。理解它们，才能公平地和 Claude Code、Codex 对比。
+    </p>
+    <ul>
+      <li><strong>没有内置权限系统</strong>：工具默认以启动用户的权限运行；需要边界就容器化，或用 <code>tool_call</code> 扩展做确认。</li>
+      <li><strong>没有 sub-agent / plan mode</strong>：官方把它留给扩展或用户自己构建；内核不预设多 Agent 调度。</li>
+      <li><strong>没有内置沙箱</strong>：codemode 是 JS 沙箱，但 bash 仍是宿主进程；隔离要靠容器/micro-VM。</li>
+      <li><strong>没有跨语言内核</strong>：SDK/RPC 提供集成方式，但核心是 TypeScript。</li>
+      <li><strong>复杂度转移到了会话投影</strong>：树、压缩、context edit、分支摘要让“当前上下文”不是一个简单数组；这是灵活性的代价。</li>
+    </ul>
+
+    <h3>7.3 如果你要自己写一个 Agent</h3>
+    <div class="steps">
+      <div class="step">
+        <h4>先写一个 100 行的 loop</h4>
+        <p>消息数组 + 一次模型调用 + 工具执行 + while。先跑通“模型 → 工具 → 模型”，不要先做 UI 和持久化。</p>
+      </div>
+      <div class="step">
+        <h4>定义消息与工具契约</h4>
+        <p>明确哪些消息进入模型、哪些只是 UI；工具必须有参数 schema、错误语义和输出预算。</p>
+      </div>
+      <div class="step">
+        <h4>把模型调用收口成一个函数</h4>
+        <p>上层只依赖 `stream(model, context, options)`；provider 差异、鉴权、重试都放在这层之后。</p>
+      </div>
+      <div class="step">
+        <h4>加事件，而不是加回调参数</h4>
+        <p>UI、日志、持久化都订阅事件；产品逻辑通过少量明确回调接入，避免 loop 变成参数垃圾场。</p>
+      </div>
+      <div class="step">
+        <h4>最后做会话与压缩</h4>
+        <p>当会话变长、需要恢复/分叉时，再引入树和摘要。过早做会把简单循环拖成框架。</p>
+      </div>
+    </div>
+
+    <!-- ============================================================ -->
+    <h2 id="source-map"><span class="h2n">08 / SOURCE MAP</span>源码导读与练习<a class="anchor" href="#source-map" aria-label="链接到本节">#</a></h2>
+
+    <p class="lead">
+      最后给一条可执行的阅读路线，以及几个能验证“你真的看懂了”的练习。所有行号基于 v1.4.0 快照。
+    </p>
+
+    <h3>8.1 推荐阅读顺序</h3>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>顺序</th><th>文件</th><th>重点</th><th>读完能回答</th></tr></thead>
+        <tbody>
+          <tr><td>1</td><td><code>packages/agent/src/types.ts</code></td><td><code>AgentMessage</code>、<code>AgentTool</code>、<code>AgentEvent</code></td><td>循环的输入输出是什么？</td></tr>
+          <tr><td>2</td><td><code>packages/agent/src/agent-loop.ts:172</code></td><td><code>runLoop</code></td><td>一个 turn 怎么开始、怎么结束？</td></tr>
+          <tr><td>3</td><td><code>packages/agent/src/agent-loop.ts:390</code></td><td><code>streamAssistantResponse</code></td><td>流式消息何时进入上下文？</td></tr>
+          <tr><td>4</td><td><code>packages/agent/src/agent.ts:194</code></td><td><code>Agent</code>、<code>createLoopConfig</code></td><td>产品如何把回调挂进循环？</td></tr>
+          <tr><td>5</td><td><code>packages/coding-agent/src/core/sdk.ts:403</code></td><td><code>new Agent(...)</code></td><td>一个真实 Agent 实例怎么装配？</td></tr>
+          <tr><td>6</td><td><code>packages/coding-agent/src/core/agent-session.ts:1873</code></td><td><code>_startRun</code> / <code>_prepareRun</code></td><td>产品层在循环外做了什么？</td></tr>
+          <tr><td>7</td><td><code>packages/coding-agent/src/core/agent-session.ts:652</code></td><td>tool hooks 桥接</td><td><code>tool_call</code> / <code>tool_result</code> 从哪来？</td></tr>
+          <tr><td>8</td><td><code>packages/coding-agent/src/core/extensions/runner.ts:1096</code></td><td><code>emit</code> / <code>emitContext</code></td><td>事件如何按顺序分发给扩展？</td></tr>
+          <tr><td>9</td><td><code>packages/coding-agent/src/core/session-manager.ts:543</code></td><td><code>buildSessionProjection</code></td><td>会话树如何变成模型上下文？</td></tr>
+          <tr><td>10</td><td><code>packages/coding-agent/src/core/compaction/compaction.ts</code></td><td>摘要与 <code>firstKeptEntryId</code></td><td>长会话怎么活下来？</td></tr>
+          <tr><td>11</td><td><code>packages/coding-agent/src/core/tools/bash.ts</code></td><td>流式、超时、截断</td><td>工具输出如何不撑爆上下文？</td></tr>
+          <tr><td>12</td><td><code>packages/coding-agent/src/main.ts:574</code></td><td>装配线</td><td>所有东西在哪被创建？</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <div class="source">
+      <span class="source__label">关键源码</span>
+      <code>packages/agent/src/agent-loop.ts:172 · runLoop</code>
+      <code>packages/agent/src/agent.ts:476 · createLoopConfig</code>
+      <code>packages/coding-agent/src/core/agent-session.ts:1926 · _prepareRun</code>
+      <code>packages/coding-agent/src/core/extensions/runner.ts:1305 · emitContext</code>
+      <code>packages/coding-agent/src/core/session-manager.ts:543 · buildSessionProjection</code>
+    </div>
+
+    <h3>8.2 四个练习</h3>
+    <ol>
+      <li>
+        <strong>画一遍事件顺序。</strong>不看本章的图，自己画出“用户输入 → 模型调两个工具 → 模型总结”的事件序列，
+        标出每个事件的触发函数。画完再对照第 4.6 节。
+      </li>
+      <li>
+        <strong>写一个只读权限闸门。</strong>用 <code>tool_call</code> 拦截 <code>write</code> / <code>edit</code>，
+        在非交互模式下直接 block；交互模式下弹确认。观察被 block 时模型收到什么。
+      </li>
+      <li>
+        <strong>加一个工具。</strong>注册一个 <code>todo</code> 工具，带 TypeBox schema、<code>details</code> 和
+        <code>renderCall</code>。把状态存在 tool result 的 <code>details</code> 里，再用 <code>session_start</code>
+        从 branch 重建。
+      </li>
+      <li>
+        <strong>写一个迷你 loop。</strong>不依赖 Pi，用 100 行实现“消息数组 + 模型调用 + 工具执行 + 最大轮数”。
+        然后加上“工具结果超过 4KB 就截断”和“模型返回长度截断时不执行工具”两条规则。
+      </li>
+    </ol>
+
+    <h3>8.3 自测：八个问题</h3>
+    <div class="quiz">
+      <details>
+        <summary>一个 turn 什么时候结束？</summary>
+        <p>当一次 assistant 响应产生的全部 tool call 都执行完、对应 toolResult 都写入上下文，并且 <code>finishTurn</code> 返回后。<code>turn_end</code> 事件在这时发出；它不是“用户消息结束”。</p>
+      </details>
+      <details>
+        <summary>为什么 steering 消息不能随便插入？</summary>
+        <p>因为 tool call 和它的 toolResult 必须成对出现。steering 只在内层循环的安全边界（当前 turn 的工具结果都写入后）注入，避免 provider 收到“有调用无结果”的上下文。</p>
+      </details>
+      <details>
+        <summary><code>prepareRequest</code> 和 <code>prepareNextTurn</code> 有什么区别？</summary>
+        <p><code>prepareRequest</code> 在每次 provider 请求前运行（包括第一次），用来换 context/model/thinking；<code>prepareNextTurn</code> 只在上一 turn 结束且确定继续时运行，用来准备下一 turn，还可以追加消息。</p>
+      </details>
+      <details>
+        <summary><code>tool_call</code> 和 <code>beforeToolCall</code> 是什么关系？</summary>
+        <p><code>beforeToolCall</code> 是内核回调；<code>AgentSession</code> 把它实现为“调用扩展的 <code>tool_call</code> 事件”。扩展层看到的是 <code>tool_call</code>，内核层看到的是 <code>beforeToolCall</code>。参数已经过 schema 校验。</p>
+      </details>
+      <details>
+        <summary>为什么 <code>agent_end</code> 不能当成“彻底结束”？</summary>
+        <p><code>agent_end</code> 只表示一次低层 run 结束。之后还可能因为可重试错误、上下文压缩、队列消息而再次 <code>continue()</code>。真正的空闲信号是 <code>agent_settled</code>。</p>
+      </details>
+      <details>
+        <summary>压缩之后，旧消息去哪了？</summary>
+        <p>仍在会话树的 JSONL 里。压缩追加一个 <code>compaction</code> entry，记录摘要和 <code>firstKeptEntryId</code>；构建上下文时只投影摘要和保留区间，旧 entry 不删除，仍可回看或分叉。</p>
+      </details>
+      <details>
+        <summary>为什么工具输出默认截断到 2000 行 / 50KB？</summary>
+        <p>工具输出直接进入模型上下文，是 token 预算的主要消耗者。截断并给出完整输出路径，既保护上下文，又让模型知道去哪继续读。工具必须为自己的输出负责。</p>
+      </details>
+      <details>
+        <summary>扩展为什么能做权限控制，但 Pi 不内置权限系统？</summary>
+        <p>扩展和 Pi 同进程、同 OS 权限，所以它能拦截 <code>tool_call</code>；但没有一个默认策略能适配所有用户。Pi 选择把策略留给扩展/容器，内核只提供可靠的工具调用路径和闸门。</p>
+      </details>
+    </div>
+
+    <h3>8.4 术语表</h3>
+    <dl class="glossary">
+      <div><dt>Harness</dt><dd>Agent 的“外壳/骨架”：把模型、工具、上下文、会话装配成可运行系统的那层代码。</dd></div>
+      <div><dt>Turn</dt><dd>一次 assistant 响应 + 它请求的全部工具执行 + 对应 toolResult。循环的调度单位。</dd></div>
+      <div><dt>Steering</dt><dd>在 turn 结束时注入的用户消息，用于边看边改方向；不会拆散工具批次。</dd></div>
+      <div><dt>Follow-up</dt><dd>在 Agent 本来要停止时注入的消息，用于“做完这个再做那个”。</dd></div>
+      <div><dt>Transcript</dt><dd>按时间/树路径记录的消息序列；Pi 的会话文件就是它的持久化形式。</dd></div>
+      <div><dt>Projection</dt><dd>从会话树 + 压缩 + context edit 派生出“这次请求真正发给模型的消息”。</dd></div>
+      <div><dt>Compaction</dt><dd>用摘要替代一段旧上下文，并记录保留起点；长会话继续工作的机制。</dd></div>
+      <div><dt>Extension</dt><dd>跑在 Pi 进程内、通过 <code>pi.on()</code> 注册钩子的 TypeScript 模块。</dd></div>
+      <div><dt>Skill</dt><dd>按需加载的说明文档；描述常驻提示词，正文在需要时读取。</dd></div>
+      <div><dt>Virtual model</dt><dd>产品层包装出的“逻辑模型”，可按请求路由到不同物理模型。</dd></div>
+      <div><dt>MCP</dt><dd>Model Context Protocol；让 Agent 接入外部工具/资源的协议。</dd></div>
+      <div><dt>Agent settled</dt><dd>没有重试、压缩或队列工作会再启动 run 的最终空闲状态。</dd></div>
+    </dl>
+
+    <div class="pager">
+      <a href="index.html">
+        <small>返回</small>
+        <strong>Agent Atlas 首页</strong>
+      </a>
+      <a href="#mental-model">
+        <small>回到开头</small>
+        <strong>01 · 三个心智模型</strong>
+      </a>
+    </div>
+  </article>
+</main>
+
+<footer class="footer">
+  <div class="wrap footer__inner">
+    <p>
+      本章基于 <code>earendil-works/pi</code> v1.4.0 源码快照整理。行号与行为可能随版本变化；
+      阅读时以你本地 checkout 为准。站点与 Pi 项目无隶属关系。
+    </p>
+    <div class="footer__links">
+      <a href="index.html">首页</a>
+      <a href="index.html#path">学习路径</a>
+      <a href="#source-map">源码导读</a>
+    </div>
+  </div>
+</footer>
+
+<script src="assets/site.js"></script>
+</body>
+</html>

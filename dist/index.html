@@ -1,0 +1,295 @@
+<title>Agent Atlas</title>
+<meta name="claude:viewport-fit-sides" content="cover">
+<meta name="description" content="沿着一次真实请求，拆解 Agent 的循环、钩子、工具、上下文与会话。第一卷：Pi Agent。">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Serif:wght@500;600&display=swap">
+<link rel="stylesheet" href="assets/site.css">
+<script>
+  (function () {
+    try {
+      var saved = localStorage.getItem("atlas-theme");
+      if (saved === "dark" || saved === "light") document.documentElement.setAttribute("data-theme", saved);
+    } catch (e) {}
+  })();
+</script>
+
+<header class="topbar">
+  <div class="topbar__inner">
+    <a class="brand" href="index.html" aria-label="Agent Atlas 首页">
+      <span class="brand__mark" aria-hidden="true">A</span>
+      <span>Agent Atlas <small>/ 解剖室</small></span>
+    </a>
+    <nav class="nav" aria-label="主导航">
+      <a class="nav__chapter" href="#path">学习路径</a>
+      <a href="#chapter">Pi 章节</a>
+      <a href="#why">阅读方法</a>
+      <button class="icon-btn" type="button" data-theme-toggle aria-label="切换主题"></button>
+    </nav>
+  </div>
+</header>
+
+<main class="wrap">
+  <section class="hero">
+    <div>
+      <span class="eyebrow">Agent Atlas · Vol. 01 / Pi Agent</span>
+      <h1>把 Agent <em>拆开</em>，<br>看它怎么跑。</h1>
+      <p class="hero__lead">
+        不背 API，不抄架构图。沿着一次真实请求，从终端输入一路走到模型响应、工具执行和会话落盘。
+        先看懂 Pi 这个最小内核，再把同一套问题带进 Claude Code、Codex 和其他 Agent。
+      </p>
+      <div class="hero__actions">
+        <a class="btn btn--primary" href="pi.html">
+          开始读 Pi 深潜
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true"><path d="M5 12h14M13 6l6 6-6 6"/></svg>
+        </a>
+        <a class="btn btn--ghost" href="#path">先看学习路径</a>
+      </div>
+    </div>
+
+    <div class="hero__diagram">
+      <figure class="diagram" style="margin:0;border:0;padding:0;background:transparent;">
+        <svg viewBox="0 0 520 430" role="img" aria-label="Agent 循环：组装上下文、请求模型、执行工具、写回消息，构成一个 turn；没有工具调用时结束。">
+          <defs>
+            <marker id="loopArrow" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+              <path d="M0,0 L10,5 L0,10 z" fill="currentColor"/>
+            </marker>
+            <marker id="loopArrowAccent" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+              <path d="M0,0 L10,5 L0,10 z" fill="var(--accent)"/>
+            </marker>
+          </defs>
+
+          <rect x="150" y="24" width="220" height="56" rx="4" class="dg-box"/>
+          <text x="260" y="47" text-anchor="middle" class="dg-label">1 · 组装上下文</text>
+          <text x="260" y="65" text-anchor="middle" class="dg-sub">system prompt · history · tools</text>
+
+          <rect x="340" y="172" width="158" height="58" rx="4" class="dg-box dg-box--accent"/>
+          <text x="419" y="195" text-anchor="middle" class="dg-label">2 · 请求模型</text>
+          <text x="419" y="213" text-anchor="middle" class="dg-sub">streamSimple</text>
+
+          <rect x="150" y="326" width="220" height="56" rx="4" class="dg-box"/>
+          <text x="260" y="349" text-anchor="middle" class="dg-label">3 · 执行工具</text>
+          <text x="260" y="367" text-anchor="middle" class="dg-sub">tool calls → results</text>
+
+          <rect x="22" y="172" width="158" height="58" rx="4" class="dg-box"/>
+          <text x="101" y="195" text-anchor="middle" class="dg-label">4 · 写回消息</text>
+          <text x="101" y="213" text-anchor="middle" class="dg-sub">assistant · toolResult</text>
+
+          <path d="M370,66 C425,92 448,126 430,168" class="dg-arrow" marker-end="url(#loopArrow)"/>
+          <path d="M420,234 C438,282 400,320 374,340" class="dg-arrow" marker-end="url(#loopArrow)"/>
+          <path d="M150,344 C104,322 62,286 82,234" class="dg-arrow" marker-end="url(#loopArrow)"/>
+          <path d="M96,172 C80,126 116,88 148,66" class="dg-arrow" marker-end="url(#loopArrow)"/>
+
+          <text x="446" y="118" text-anchor="middle" class="dg-sub">request</text>
+          <text x="444" y="278" text-anchor="middle" class="dg-sub">yes · tool call</text>
+          <text x="96" y="306" text-anchor="middle" class="dg-sub">results</text>
+          <text x="82" y="116" text-anchor="middle" class="dg-sub">next turn</text>
+
+          <text x="260" y="238" text-anchor="middle" class="dg-num">一个 turn</text>
+          <text x="260" y="256" text-anchor="middle" class="dg-sub">assistant + tool results</text>
+
+          <path d="M12,44 L146,44" class="dg-arrow dg-arrow--accent" marker-end="url(#loopArrowAccent)"/>
+          <text x="14" y="33" class="dg-sub">prompt</text>
+
+          <path d="M498,215 L514,215" class="dg-arrow" marker-end="url(#loopArrow)"/>
+          <text x="514" y="238" text-anchor="end" class="dg-sub">no tool call</text>
+          <text x="514" y="254" text-anchor="end" class="dg-sub">→ agent_end</text>
+
+          <text x="500" y="150" text-anchor="end" class="dg-sub">steering 在此进入</text>
+          <path d="M500,158 L462,170" class="dg-arrow dg-arrow--accent" marker-end="url(#loopArrowAccent)"/>
+        </svg>
+        <figcaption class="diagram-cap">Pi 的最小循环：一个 turn = 一次模型响应 + 它请求的工具执行。</figcaption>
+      </figure>
+    </div>
+  </section>
+
+  <section class="stats" aria-label="Pi 源码快照数据">
+    <div class="stat">
+      <div class="stat__num">11</div>
+      <div class="stat__label">monorepo 包，内核与产品分离</div>
+    </div>
+    <div class="stat">
+      <div class="stat__num">2.5k</div>
+      <div class="stat__label">行 agent-core，一个下午能读完</div>
+    </div>
+    <div class="stat">
+      <div class="stat__num">76k</div>
+      <div class="stat__label">行 coding-agent，复杂度在产品和边界</div>
+    </div>
+    <div class="stat">
+      <div class="stat__num">80</div>
+      <div class="stat__label">个扩展示例，钩子都有可跑的参照</div>
+    </div>
+  </section>
+
+  <section class="section" id="path">
+    <div class="section__head">
+      <div>
+        <span class="kicker">Learning path</span>
+        <h2>六步，从“知道”走到“能改”。</h2>
+      </div>
+      <p>
+        每一步只回答一个问题，并按依赖顺序排列。不要从目录结构开始背；先建立“一次请求如何流动”的模型，
+        再回头把文件放回它该在的位置。
+      </p>
+    </div>
+
+    <div class="path">
+      <a class="path__item" href="pi.html#mental-model">
+        <span class="path__n">STEP 01</span>
+        <h3>建立三个心智模型</h3>
+        <p>LLM 只会说话；Agent = 循环 + 工具 + 上下文；引擎和产品是两层。</p>
+        <span class="arrow">→ mental model</span>
+      </a>
+      <a class="path__item" href="pi.html#architecture">
+        <span class="path__n">STEP 02</span>
+        <h3>看清项目分层</h3>
+        <p>11 个包各自解决什么问题，依赖箭头为什么朝一个方向。</p>
+        <span class="arrow">→ architecture</span>
+      </a>
+      <a class="path__item" href="pi.html#request-life">
+        <span class="path__n">STEP 03</span>
+        <h3>跟一次请求</h3>
+        <p>从 <code>session.prompt()</code> 到 JSONL 落盘，标出每一站的源码位置。</p>
+        <span class="arrow">→ request life</span>
+      </a>
+      <a class="path__item" href="pi.html#agent-loop">
+        <span class="path__n">STEP 04</span>
+        <h3>吃透 Agent Loop</h3>
+        <p>内外双层循环、turn 的边界、并行工具、steering 与 follow-up。</p>
+        <span class="arrow">→ agent loop</span>
+      </a>
+      <a class="path__item" href="pi.html#hooks">
+        <span class="path__n">STEP 05</span>
+        <h3>掌握 Hook 机制</h3>
+        <p>引擎回调、扩展事件、工具内部三层钩子，以及它们的执行顺序。</p>
+        <span class="arrow">→ hooks</span>
+      </a>
+      <a class="path__item" href="pi.html#infra">
+        <span class="path__n">STEP 06</span>
+        <h3>理解 Agent Infra</h3>
+        <p>工具、系统提示、上下文压缩、会话树、provider 与 UI 模式。</p>
+        <span class="arrow">→ infrastructure</span>
+      </a>
+    </div>
+  </section>
+
+  <section class="section section--tight" id="chapter">
+    <div class="section__head">
+      <div>
+        <span class="kicker">Published chapter</span>
+        <h2>第一卷：Pi Agent</h2>
+      </div>
+      <p>
+        Pi 的野心不是“功能最多”，而是“内核最小、边界最清楚、可改造性最强”。
+        这让它成为学习 Agent 基础设施的好样本：你不需要先理解一万行产品逻辑，才能看到循环本身。
+      </p>
+    </div>
+
+    <article class="chapter">
+      <div class="chapter__main">
+        <div class="chapter__label">
+          <span class="badge badge--ok">已完成</span>
+          <span class="badge badge--accent">源码快照 v1.4.0</span>
+          <span class="badge">35 min</span>
+        </div>
+        <h2>最小内核，最大可塑性</h2>
+        <p class="chapter__lead">
+          从 <code>packages/agent/src/agent-loop.ts</code> 的 <code>runLoop()</code> 开始，
+          逐层向上读到 CLI、会话树和扩展系统。每个结论都落到一个文件、一个函数或一次真实事件。
+        </p>
+        <div class="chapter__toc">
+          <a href="pi.html#mental-model"><span>01</span>三个心智模型</a>
+          <a href="pi.html#architecture"><span>02</span>项目全景与分层</a>
+          <a href="pi.html#request-life"><span>03</span>一次请求的一生</a>
+          <a href="pi.html#agent-loop"><span>04</span>Agent Loop 拆解</a>
+          <a href="pi.html#hooks"><span>05</span>Hook 触发机制</a>
+          <a href="pi.html#infra"><span>06</span>Agent Infra 全景</a>
+          <a href="pi.html#lessons"><span>07</span>设计取舍与结论</a>
+          <a href="pi.html#source-map"><span>08</span>源码导读与练习</a>
+        </div>
+      </div>
+      <aside class="chapter__side">
+        <dl class="meta-list">
+          <div class="meta-row"><dt>语言 / 运行时</dt><dd>TypeScript · Node 22</dd></div>
+          <div class="meta-row"><dt>Agent 内核</dt><dd>pi-agent-core</dd></div>
+          <div class="meta-row"><dt>产品外壳</dt><dd>pi-coding-agent</dd></div>
+          <div class="meta-row"><dt>模型层</dt><dd>pi-ai</dd></div>
+          <div class="meta-row"><dt>源码规模</dt><dd>~110k LOC</dd></div>
+        </dl>
+        <a class="btn btn--primary" href="pi.html">
+          进入章节
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true"><path d="M5 12h14M13 6l6 6-6 6"/></svg>
+        </a>
+        <p style="font-size:12.5px;color:var(--fg-muted);line-height:1.65;margin:0;">
+          建议先读“一次请求的一生”，再回头读 loop 和 hooks。顺序反过来容易陷进细节。
+        </p>
+      </aside>
+    </article>
+  </section>
+
+  <section class="section" id="why">
+    <div class="section__head">
+      <div>
+        <span class="kicker">Why this way</span>
+        <h2>为什么从 Pi 开始，而不是直接读 Claude Code？</h2>
+      </div>
+      <p>
+        Claude Code 和 Codex 是成熟产品，读它们时你很难区分“Agent 的本质”和“产品的妥协”。
+        Pi 把两者拆成了不同包：先看内核，再看外壳，最后带着问题去对照其他实现。
+      </p>
+    </div>
+
+    <div class="principles">
+      <div class="principle">
+        <span class="principle__n">01 / SMALL KERNEL</span>
+        <h3>内核小到可以通读</h3>
+        <p>
+          <code>pi-agent-core</code> 只有 2,539 行。循环、状态、工具契约、事件全在一个包里，
+          没有框架魔法，也没有隐藏的调度器。
+        </p>
+      </div>
+      <div class="principle">
+        <span class="principle__n">02 / CLEAN SEAMS</span>
+        <h3>接缝清楚</h3>
+        <p>
+          模型调用被收口到 <code>StreamFn</code>，产品行为被收口到 <code>AgentSession</code>，
+          扩展通过事件接入。每一层都可以单独替换。
+        </p>
+      </div>
+      <div class="principle">
+        <span class="principle__n">03 / REAL HOOKS</span>
+        <h3>钩子是真实存在的</h3>
+        <p>
+          文档里的生命周期图不是装饰：每个扩展事件都能在源码里找到对应的触发点和返回语义。
+          学会一套，换到别的 Agent 也能快速定位。
+        </p>
+      </div>
+    </div>
+
+    <div class="callout">
+      <span class="callout__label">阅读方法</span>
+      <p>
+        读每个模块时只问三个问题：它接收什么、它返回什么、它在什么时候被调用。
+        如果答不上来，说明你读的是“目录”，不是“机制”。
+      </p>
+    </div>
+  </section>
+</main>
+
+<footer class="footer">
+  <div class="wrap footer__inner">
+    <p>
+      Agent Atlas 是一个持续生长的 Agent 拆解学习项目。当前内容基于
+      <code>earendil-works/pi</code> v1.4.0 源码快照整理，代码位置以该版本为准。
+      站点与 Pi 项目无隶属关系。
+    </p>
+    <div class="footer__links">
+      <a href="pi.html">Pi 深潜</a>
+      <a href="#path">学习路径</a>
+      <span>2026-10</span>
+    </div>
+  </div>
+</footer>
+
+<script src="assets/site.js"></script>
