@@ -1,0 +1,139 @@
+[
+ {
+  "run": "t1-fullturn",
+  "req": "req-001.json",
+  "kind": "agent",
+  "messages": 2,
+  "body_bytes": 6186,
+  "roles": [
+   "system",
+   "user"
+  ]
+ },
+ {
+  "run": "t1-fullturn",
+  "req": "req-002.json",
+  "kind": "agent",
+  "messages": 4,
+  "body_bytes": 18565,
+  "roles": [
+   "system",
+   "user",
+   "assistant",
+   "tool"
+  ]
+ },
+ {
+  "run": "t1-fullturn",
+  "req": "req-003.json",
+  "kind": "agent",
+  "messages": 6,
+  "body_bytes": 71498,
+  "roles": [
+   "system",
+   "user",
+   "assistant",
+   "tool",
+   "assistant",
+   "tool"
+  ]
+ },
+ {
+  "run": "t1-fullturn",
+  "req": "req-004.json",
+  "kind": "summarization",
+  "messages": 2,
+  "body_bytes": 6006,
+  "roles": [
+   "system",
+   "user"
+  ]
+ },
+ {
+  "run": "t1-fullturn",
+  "req": "req-005.json",
+  "kind": "agent",
+  "messages": 4,
+  "body_bytes": 8189,
+  "roles": [
+   "system",
+   "user",
+   "assistant",
+   "tool"
+  ]
+ },
+ {
+  "run": "o1-overflow",
+  "req": "req-001.json",
+  "kind": "agent",
+  "messages": 2,
+  "body_bytes": 6186,
+  "roles": [
+   "system",
+   "user"
+  ]
+ },
+ {
+  "run": "o1-overflow",
+  "req": "req-002.json",
+  "kind": "agent",
+  "messages": 4,
+  "body_bytes": 18565,
+  "roles": [
+   "system",
+   "user",
+   "assistant",
+   "tool"
+  ]
+ },
+ {
+  "run": "o1-overflow",
+  "req": "req-003.json",
+  "kind": "agent",
+  "messages": 6,
+  "body_bytes": 71498,
+  "roles": [
+   "system",
+   "user",
+   "assistant",
+   "tool",
+   "assistant",
+   "tool"
+  ]
+ },
+ {
+  "run": "o1-overflow",
+  "req": "req-004.json",
+  "kind": "summarization",
+  "messages": 2,
+  "body_bytes": 6006,
+  "roles": [
+   "system",
+   "user"
+  ]
+ },
+ {
+  "run": "o1-overflow",
+  "req": "req-005.json",
+  "kind": "agent",
+  "messages": 2,
+  "body_bytes": 7002,
+  "roles": [
+   "system",
+   "user"
+  ]
+ },
+ {
+  "run": "o1-overflow",
+  "req": "req-006.json",
+  "kind": "agent",
+  "messages": 4,
+  "body_bytes": 8189,
+  "roles": [
+   "system",
+   "user",
+   "assistant",
+   "tool"
+  ]
+ }
+]

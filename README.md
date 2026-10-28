@@ -18,6 +18,12 @@
   - 设计取舍与可迁移结论
   - 源码导读、练习、自测与术语表
 
+## 实验
+
+- `experiments/pi-context-compaction.md` — 上下文压缩机制实测：阈值压缩、切点选择、
+  工具结果截断、显式/静默超限恢复，附真实请求体、事件流与 session 记录
+- `experiments/rig/` — 可复现装置（脚本化 provider + 启动脚本）
+
 ## 本地预览
 
 ```bash
@@ -62,7 +68,7 @@ python3 scripts/build_artifact.py
 
 - Claude Code：工具权限、hooks、子 Agent、计划模式
 - Codex：沙箱、审批模型、执行循环
-- 横向专题：上下文压缩、工具协议、多 Agent 调度、评测
+- 横向专题：工具协议、多 Agent 调度、评测
 
 ## 说明
 
